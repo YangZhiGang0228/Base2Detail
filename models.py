@@ -45,7 +45,7 @@ class SubdNet(torch.nn.Module):
         
         self.pool = torch.nn.AvgPool2d((2,1)) 
         
-        # 全局缓存静态拓扑索引，避免循环中重复创建
+        # 全局缓存拓扑索引，避免循环中重复创建
         self.topo_cache = {}
 
     def halfEdgePool(self, fhe):
