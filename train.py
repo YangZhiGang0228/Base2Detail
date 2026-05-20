@@ -45,10 +45,12 @@ def main():
     trainP2pLossHis = []
     validP2pLossHis = []
     
-    # ================= [新增] 记录 consist loss 的列表 =================
     trainConsistLossHis = [] 
     validConsistLossHis = []
-    # =================================================================
+    
+    trainSparLossHis = [] 
+    validSparLossHis = []
+
     
     bestLoss = np.inf
     nSub = params["numSubd"]
@@ -58,14 +60,16 @@ def main():
         # loop over training shapes 
         trainErr = 0.0
         trainp2pErr = 0.0
-        trainConsistErr = 0.0 # [新增] 初始化单个 epoch 的 train consist loss
+        trainConsistErr = 0.0 
+        trainSparErr = 0.0
+
         
         for mIdx in range(S.nM):
             # forward pass
             x = S.getInputData(mIdx)
             
             # 传入训练集的 groupedLocalData
-            outputs, consist_loss = net(x, mIdx, S.hfList, S.poolMats, S.dofs, S.Us, S.Lambdas, S.groupedLocalData)
+            outputs, consist_loss, sparse_loss = net(x, mIdx, S.hfList, S.poolMats, S.dofs, S.Us, S.Lambdas, S.groupedLocalData)
             
             # target mesh
             Vt = S.meshes[mIdx][params["numSubd"]].V.to(params['device'])
@@ -74,12 +78,12 @@ def main():
             # compute loss function
             loss = 0.0
             p2p_loss = 0.0
-            for ii in range(params["numSubd"]):
+            for ii in range(params["numSubd"]+1):
                 nV = outputs[ii].size(0)
                 V = S.meshes[mIdx][ii].V.to(params['device'])
                 p2p_loss += lossFunc(outputs[ii], V[:nV,:])#
                 
-            loss = p2p_loss+consist_loss
+            loss = p2p_loss+0.1*consist_loss+0.01*sparse_loss
             
             optimizer.zero_grad()
             loss.backward()
@@ -87,25 +91,26 @@ def main():
 
             # record training error
             trainErr += loss.cpu().data.numpy()
-            
-            # [新增] 提取 consist_loss 并累加 (兼容 Tensor 和 float 0.0 的情况)
             trainp2pErr += p2p_loss.item()
-            c_loss_val = consist_loss.item() if torch.is_tensor(consist_loss) else consist_loss
-            trainConsistErr += c_loss_val
+            trainConsistErr += consist_loss.item()
+            trainSparErr += sparse_loss.item()
 
         trainLossHis.append(trainErr / S.nM)
         trainP2pLossHis.append(trainp2pErr / S.nM)
-        trainConsistLossHis.append(trainConsistErr / S.nM) # [新增] 记录 epoch 均值
+        trainConsistLossHis.append(trainConsistErr / S.nM) 
+        trainSparLossHis.append(trainSparErr/S.nM)
+
 
         # loop over validation shapes 
         validErr = 0.0
         validp2pErr = 0.0
-        validConsistErr = 0.0 # [新增] 初始化单个 epoch 的 valid consist loss
+        validConsistErr = 0.0 
+        validSparErr = 0.0
         
         for mIdx in range(T.nM):
             x = T.getInputData(mIdx)
             
-            outputs, consist_loss = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
+            outputs, consist_loss, sparse_loss = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
             
             # target mesh
             Vt = T.meshes[mIdx][params["numSubd"]].V.to(params['device'])
@@ -114,24 +119,26 @@ def main():
             # compute loss function
             loss = 0.0
             p2p_loss = 0.0
-            for ii in range(params["numSubd"]):
+            for ii in range(params["numSubd"]+1):
                 nV = outputs[ii].size(0)
                 V = T.meshes[mIdx][ii].V.to(params['device']) 
                 p2p_loss += lossFunc(outputs[ii], V[:nV,:])
                 
-            loss = p2p_loss+consist_loss    
+            loss = p2p_loss+0.1*consist_loss+0.01*sparse_loss    
             
             # record validation error
             validErr += loss.cpu().data.numpy()
             
-            # [新增] 提取 consist_loss 并累加
             validp2pErr += p2p_loss.item()
             c_loss_val = consist_loss.item() if torch.is_tensor(consist_loss) else consist_loss
             validConsistErr += c_loss_val
+            validSparErr += sparse_loss.item()
             
         validLossHis.append(validErr / T.nM)
         validP2pLossHis.append(validp2pErr / T.nM)
-        validConsistLossHis.append(validConsistErr / T.nM) # [新增] 记录 epoch 均值
+        validConsistLossHis.append(validConsistErr / T.nM) 
+        validSparLossHis.append(validSparErr / T.nM)
+
 
         # save the best model
         if validErr < bestLoss:
@@ -149,6 +156,9 @@ def main():
     
     np.savetxt(params['output_path']+'train_consist_loss.txt', np.array(trainConsistLossHis), delimiter=',')
     np.savetxt(params['output_path']+'valid_consist_loss.txt', np.array(validConsistLossHis), delimiter=',')
+
+    np.savetxt(params['output_path']+'train_spar_loss.txt', np.array(trainSparLossHis), delimiter=',')
+    np.savetxt(params['output_path']+'valid_spar_loss.txt', np.array(validSparLossHis), delimiter=',')
     # ========================================================================
 
     # write output shapes (validation set)
@@ -168,7 +178,7 @@ def main():
     # write rotated output shapes (validation set)
     mIdx = 0
     x = T.getInputData(mIdx)
-    outputs,_ = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
+    outputs,_,_ = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
 
     dV = torch.rand(1, 3).to(params['device'])
     R = random3DRotation().to(params['device'])
@@ -177,7 +187,7 @@ def main():
     x[:,6:] = x[:,6:].mm(R.t())
     x[:,:3] += dV
     
-    outputs,_ = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
+    outputs,_,_ = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
 
     # write rotated outputs
     for ii in range(len(outputs)):
