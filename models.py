@@ -2,6 +2,8 @@ from include import *
 import torch.nn.functional as F
 import torch
 import numpy as np
+from sparse_loss import sparse_s_loss_sum_count
+
 
 class MLP(torch.nn.Module):
     def __init__(self, Din, Dhid, Dout):
@@ -32,6 +34,7 @@ class SubdNet(torch.nn.Module):
         self.V_feat_dim = 9+self.D_lifted + 2*self.PE_dim
         self.V_view_dim = 9+self.D_lifted+self.PE_dim
         self.V_local_dim = self.D_lifted+self.Dout_feature
+        self.sparse_a = float(params.get("sparse_a", 1e-2))
         
         self.net_init = MLP(9 + 6, params['h_initNet'], self.Dout_feature)
         self.net_lift = MLP(self.Dout_feature, params['h_liftNet'], self.D_lifted)
@@ -93,6 +96,8 @@ class SubdNet(torch.nn.Module):
         outputs = []
         consist_losses = []
         device = fv.device
+        sparse_loss_sum = fv.new_tensor(0.0)
+        sparse_loss_count = 0
         
         pos = fv[:, :3]
         
@@ -223,8 +228,9 @@ class SubdNet(torch.nn.Module):
                 Q = Q_flat.view(B, n, n+1, n+1)
                 S = torch.matmul(Q, torch.matmul(L_mat, Q.transpose(2, 3)))
 
-                if n==3:
-                    print("有度数为3的中心点")
+                s_sum, s_count = sparse_s_loss_sum_count(S, self.sparse_a)
+                sparse_loss_sum = sparse_loss_sum + s_sum
+                sparse_loss_count += s_count
 
                 V_in_local = torch.zeros(B, n, n+1, 3, device=device)
                 V_in_local[:, :, 1:, :] = v1_local 
@@ -266,5 +272,6 @@ class SubdNet(torch.nn.Module):
             outputs.append(pos)
 
         total_consist_loss = sum(consist_losses) if consist_losses else 0.0
+        sparse_loss = sparse_loss_sum / sparse_loss_count
 
-        return outputs, total_consist_loss
+        return outputs, total_consist_loss, sparse_loss
