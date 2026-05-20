@@ -78,7 +78,7 @@ def main():
             # compute loss function
             loss = 0.0
             p2p_loss = 0.0
-            for ii in range(params["numSubd"]+1):
+            for ii in range(params["numSubd"]+1): #错误原因，在此位置少加1
                 nV = outputs[ii].size(0)
                 V = S.meshes[mIdx][ii].V.to(params['device'])
                 p2p_loss += lossFunc(outputs[ii], V[:nV,:])#
