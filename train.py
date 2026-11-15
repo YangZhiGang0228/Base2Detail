@@ -1,198 +1,251 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-from include import *
-from models import *
-NETPARAMS = 'netparams.dat'
+import argparse
+import json
+import pickle
+from pathlib import Path
 
-# should run the file like "python train.py ./path/to/folder/"
-def main():
+import torch
 
-    # load hyper parameters
-    folder = sys.argv[1]
-    with open(folder + 'hyperparameters.json', 'r') as f:
-        params = json.load(f)
+from include import tgp
+from mesh_errors import normal_error, point2mesh_error
+from models import SubdBaseNet, SubdDispNet, compute_vertex_normals
+from stage2_checkpoint import (
+    STAGE2_QUANTIZED_CHECKPOINT,
+    load_quantized_disp,
+    save_quantized_disp,
+)
 
-    # load traininig data
-    S = pickle.load(open(params["train_pkl"], "rb"))
-    S.computeParameters()
-    S.toDevice(params["device"])
-    
-    # load validation set
-    T = pickle.load(open(params["valid_pkl"], "rb"))    
-    T.computeParameters()
-    T.toDevice(params["device"])
 
-    # initialize network 
-    def init_weights(m):
-        if type(m) == torch.nn.Linear:
-            torch.nn.init.xavier_normal_(m.weight)
-    net = SubdNet(params)
-    net = net.to(params['device'])
-    net.apply(init_weights)
+BASE_CHECKPOINT = "netparams_base.dat"
+BEST_P2M_OBJ = "best_p2m.obj"
 
-    # loss function
-    lossFunc = torch.nn.MSELoss().to(params['device'])
 
-    # optimizer
-    optimizer = torch.optim.Adam(net.parameters(),lr=params['lr'])
+def unique_mesh_edges(faces):
+    """Return each undirected triangle edge once, as used by the Stage-2 loss."""
+    edges = torch.cat((faces[:, [0, 1]], faces[:, [1, 2]],
+                       faces[:, [2, 0]]), dim=0)
+    return torch.unique(torch.sort(edges, dim=1).values, dim=0)
 
-    # training
-    trainLossHis = []
-    validLossHis = []
 
-    trainP2pLossHis = []
-    validP2pLossHis = []
-    
-    trainConsistLossHis = [] 
-    validConsistLossHis = []
-    
-    trainSparLossHis = [] 
-    validSparLossHis = []
+def scalar_gradient_loss(prediction, target, edges):
+    """Mean squared difference of predicted and target scalar edge gradients."""
+    residual = prediction - target
+    return (residual[edges[:, 0]] - residual[edges[:, 1]]).square().mean()
 
-    
-    bestLoss = np.inf
-    nSub = params["numSubd"]
-    for epoch in range(params['epochs']):      
-        ts = time.time()
 
-        # loop over training shapes 
-        trainErr = 0.0
-        trainp2pErr = 0.0
-        trainConsistErr = 0.0 
-        trainSparErr = 0.0
+def stage2_training_loss(prediction, target, edges, gradient_weight):
+    """Return displacement MSE, edge-gradient MSE, and their weighted sum."""
+    di_loss = torch.nn.functional.mse_loss(prediction, target)
+    grad_loss = scalar_gradient_loss(prediction, target, edges)
+    return di_loss, grad_loss, di_loss + gradient_weight * grad_loss
 
-        
-        for mIdx in range(S.nM):
-            # forward pass
-            x = S.getInputData(mIdx)
-            
-            # 传入训练集的 groupedLocalData
-            outputs, consist_loss, sparse_loss = net(x, mIdx, S.hfList, S.poolMats, S.dofs, S.Us, S.Lambdas, S.groupedLocalData)
-            
-            # target mesh
-            Vt = S.meshes[mIdx][params["numSubd"]].V.to(params['device'])
-            Ft = S.meshes[mIdx][params["numSubd"]].F
 
-            # compute loss function
-            loss = 0.0
-            p2p_loss = 0.0
-            for ii in range(params["numSubd"]+1): #错误原因，在此位置少加1
-                nV = outputs[ii].size(0)
-                V = S.meshes[mIdx][ii].V.to(params['device'])
-                p2p_loss += lossFunc(outputs[ii], V[:nV,:])#
-                
-            loss = p2p_loss+0.1*consist_loss+0.01*sparse_loss
-            
+def set_global_seed(seed):
+    torch.manual_seed(int(seed))
+    torch.cuda.manual_seed_all(int(seed))
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def load_meshes(path, params):
+    with open(path, "rb") as stream:
+        meshes = pickle.load(stream)
+    meshes.computeParameters(int(params["stage1_pe_dim"]))
+    meshes.toDevice(params["device"])
+    return meshes
+
+
+def train_stage1(params, folder, epochs):
+    set_global_seed(params["seed"])
+    device = torch.device(params["device"])
+    train_meshes = load_meshes(params["train_pkl"], params)
+    valid_meshes = (train_meshes if Path(params["valid_pkl"]).resolve() == Path(params["train_pkl"]).resolve()
+                    else load_meshes(params["valid_pkl"], params))
+    train_targets = [[mesh.V.to(device) for mesh in hierarchy] for hierarchy in train_meshes.meshes]
+    valid_targets = (train_targets if valid_meshes is train_meshes else
+                     [[mesh.V.to(device) for mesh in hierarchy] for hierarchy in valid_meshes.meshes])
+
+    model = SubdBaseNet(params).to(device)
+    for module in model.modules():
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.xavier_normal_(module.weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(params["lr"]))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=float(params["stage1_eta_min"]))
+    mse = torch.nn.MSELoss()
+    best = float("inf")
+    log_every = int(params["stage1_log_every"])
+
+    for epoch in range(epochs):
+        model.train()
+        train_error = torch.zeros((), device=device)
+        for mesh_index in range(train_meshes.nM):
+            outputs, _ = model(
+                train_meshes.getInputData(mesh_index), mesh_index,
+                train_meshes.hfList, train_meshes.poolMats,
+                train_meshes.dofs, train_meshes.groupedLocalData, return_features=False)
+            loss = sum(
+                mse(output, train_targets[mesh_index][level][:len(output)])
+                for level, output in enumerate(outputs))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            train_error += loss.detach()
+        scheduler.step()
 
-            # record training error
-            trainErr += loss.cpu().data.numpy()
-            trainp2pErr += p2p_loss.item()
-            trainConsistErr += consist_loss.item()
-            trainSparErr += sparse_loss.item()
+        evaluate = epoch % int(params["stage1_valid_eval_every"]) == 0 or epoch == epochs - 1
+        valid_text = "skipped"
+        if evaluate:
+            model.eval()
+            valid_error = 0.0
+            with torch.no_grad():
+                for mesh_index in range(valid_meshes.nM):
+                    outputs, _ = model(
+                        valid_meshes.getInputData(mesh_index), mesh_index,
+                        valid_meshes.hfList, valid_meshes.poolMats,
+                        valid_meshes.dofs, valid_meshes.groupedLocalData, return_features=False)
+                    target = valid_targets[mesh_index][-1]
+                    valid_error += float(mse(outputs[-1], target[:len(outputs[-1])]))
+            valid_error /= valid_meshes.nM
+            valid_text = "%.6e" % valid_error
+            if valid_error < best:
+                best = valid_error
+                torch.save(model.state_dict(), folder / BASE_CHECKPOINT)
 
-        trainLossHis.append(trainErr / S.nM)
-        trainP2pLossHis.append(trainp2pErr / S.nM)
-        trainConsistLossHis.append(trainConsistErr / S.nM) 
-        trainSparLossHis.append(trainSparErr/S.nM)
+        if evaluate or epoch % log_every == 0:
+            print("[Stage 1] epoch %d train %.6e valid %s" % (
+                epoch, train_error / train_meshes.nM,
+                valid_text))
 
-
-        # loop over validation shapes 
-        validErr = 0.0
-        validp2pErr = 0.0
-        validConsistErr = 0.0 
-        validSparErr = 0.0
-        
-        for mIdx in range(T.nM):
-            x = T.getInputData(mIdx)
-            
-            outputs, consist_loss, sparse_loss = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
-            
-            # target mesh
-            Vt = T.meshes[mIdx][params["numSubd"]].V.to(params['device'])
-            Ft = T.meshes[mIdx][params["numSubd"]].F
-
-            # compute loss function
-            loss = 0.0
-            p2p_loss = 0.0
-            for ii in range(params["numSubd"]+1):
-                nV = outputs[ii].size(0)
-                V = T.meshes[mIdx][ii].V.to(params['device']) 
-                p2p_loss += lossFunc(outputs[ii], V[:nV,:])
-                
-            loss = p2p_loss+0.1*consist_loss+0.01*sparse_loss    
-            
-            # record validation error
-            validErr += loss.cpu().data.numpy()
-            
-            validp2pErr += p2p_loss.item()
-            c_loss_val = consist_loss.item() if torch.is_tensor(consist_loss) else consist_loss
-            validConsistErr += c_loss_val
-            validSparErr += sparse_loss.item()
-            
-        validLossHis.append(validErr / T.nM)
-        validP2pLossHis.append(validp2pErr / T.nM)
-        validConsistLossHis.append(validConsistErr / T.nM) 
-        validSparLossHis.append(validSparErr / T.nM)
+    print("[Stage 1] best final-level MSE %.6e" % best)
 
 
-        # save the best model
-        if validErr < bestLoss:
-            bestLoss = validErr
-            torch.save(net.state_dict(),params['output_path'] + NETPARAMS)
+def train_stage2(params, folder, epochs):
+    device = torch.device(params["device"])
+    seed = params["p2m_seed"]
+    set_global_seed(seed)
+    train_meshes = load_meshes(params["train_pkl"], params)
+    mesh_index = int(params["stage2_mesh_index"])
+    level = int(params["numSubd"])
 
-        print("epoch %d, train loss %.6e, valid loss %.6e, remain time: %s" % (epoch, trainLossHis[-1], validLossHis[-1], int(round((params['epochs']-epoch) * (time.time() - ts)))))
+    net_base = SubdBaseNet(params).to(device)
+    net_base.load_state_dict(torch.load(
+        folder / BASE_CHECKPOINT, map_location=device, weights_only=True))
+    net_base.requires_grad_(False)
+    net_base.eval()
 
-    # save loss history
-    np.savetxt(params['output_path']+'train_loss.txt', np.array(trainLossHis), delimiter=',')
-    np.savetxt(params['output_path']+'valid_loss.txt', np.array(validLossHis), delimiter=',')
+    with torch.no_grad():
+        base_outputs, _ = net_base(
+            train_meshes.getInputData(mesh_index), mesh_index,
+            train_meshes.hfList, train_meshes.poolMats,
+            train_meshes.dofs, train_meshes.groupedLocalData)
+        base = base_outputs[-1].detach()
+        target = train_meshes.meshes[mesh_index][level].V.to(device)
+        faces = train_meshes.meshes[mesh_index][level].F.to(device)
+        reference = train_meshes.orig_meshes[mesh_index].V.to(device)
+        reference_faces = train_meshes.orig_meshes[mesh_index].F.to(device)
 
-    np.savetxt(params['output_path']+'train_p2p_loss.txt', np.array(trainP2pLossHis), delimiter=',')
-    np.savetxt(params['output_path']+'valid_p2p_loss.txt', np.array(validP2pLossHis), delimiter=',')
-    
-    np.savetxt(params['output_path']+'train_consist_loss.txt', np.array(trainConsistLossHis), delimiter=',')
-    np.savetxt(params['output_path']+'valid_consist_loss.txt', np.array(validConsistLossHis), delimiter=',')
+    model = SubdDispNet(params).to(device)
+    features = model.anchor_features(base).detach()
+    base_normals = compute_vertex_normals(base, faces).detach()
+    target_scalar = ((target - base) * base_normals).sum(dim=1, keepdim=True)
+    model.output_scale = float(target_scalar.abs().max())
+    normalized_target = target_scalar / model.output_scale
+    edges = unique_mesh_edges(faces)
+    grad_weight = float(params["stage2_gradient_weight"])
+    if grad_weight < 0:
+        raise ValueError("stage2_gradient_weight must be non-negative")
 
-    np.savetxt(params['output_path']+'train_spar_loss.txt', np.array(trainSparLossHis), delimiter=',')
-    np.savetxt(params['output_path']+'valid_spar_loss.txt', np.array(validSparLossHis), delimiter=',')
-    # ========================================================================
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(params["stage2_lr"]))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=float(params["stage2_eta_min"]))
+    checkpoint = folder / STAGE2_QUANTIZED_CHECKPOINT
+    candidate = Path(str(checkpoint) + ".candidate")
+    scale = train_meshes.transforms[mesh_index]["scale"].cpu()
+    center = train_meshes.transforms[mesh_index]["center"].cpu()
+    bits = int(params["stage2_quantization_bits"])
+    p2m_samples = int(params["stage2_p2m_samples"])
+    best_p2m = float("inf")
 
-    # write output shapes (validation set)
-    mIdx = 0
-    x = T.getInputData(mIdx)
-    
-    outputs,_ = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
+    for epoch in range(epochs):
+        model.train()
+        scalar = model.net_disp(features)
+        di_loss, grad_loss, loss = stage2_training_loss(
+            scalar, normalized_target, edges, grad_weight)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
 
-    # write unrotated outputs
-    tgp.writeOBJ(params['output_path'] + str(mIdx) +'_oracle.obj',\
-        T.meshes[mIdx][len(outputs)-1].V.to('cpu'),\
-        T.meshes[mIdx][len(outputs)-1].F.to('cpu'))
-    for ii in range(len(outputs)):
-        x = outputs[ii].cpu()
-        tgp.writeOBJ(params['output_path'] + str(mIdx) +'_subd' + str(ii) + '.obj',x, T.meshes[mIdx][ii].F.to('cpu'))
+        evaluate = (epoch == 0 or (epoch + 1) % int(params["stage2_p2m_eval_every"]) == 0
+                    or epoch == epochs - 1)
+        p2m = None
+        if evaluate:
+            save_quantized_disp(model, candidate, bits=bits)
+            quantized = SubdDispNet(params).to(device)
+            load_quantized_disp(quantized, candidate, device)
+            with torch.no_grad():
+                reconstructed = quantized(base, F=faces)
+                value, _, _ = point2mesh_error(
+                    reconstructed, faces, reference, reference_faces,
+                    sample_seed=seed, num_samples=p2m_samples)
+            p2m = float(value)
+            if p2m < best_p2m:
+                best_p2m = p2m
+                candidate.replace(checkpoint)
+                tgp.writeOBJ(str(folder / BEST_P2M_OBJ),
+                             reconstructed.cpu() * scale + center, faces.cpu())
+                print("[Stage 2] epoch %d new best P2M %.6e, saved %s" % (
+                    epoch, p2m, BEST_P2M_OBJ))
 
-    # write rotated output shapes (validation set)
-    mIdx = 0
-    x = T.getInputData(mIdx)
-    outputs,_,_ = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
+        if evaluate or epoch % int(params["stage2_log_every"]) == 0:
+            print("[Stage 2] epoch %d di MSE %.6e gradient MSE %.6e "
+                  "total %.6e quantized P2M %s" % (
+                      epoch, float(di_loss), float(grad_loss), float(loss),
+                      "%.6e" % p2m if p2m is not None else "skipped"))
 
-    dV = torch.rand(1, 3).to(params['device'])
-    R = random3DRotation().to(params['device'])
-    x[:,:3] = x[:,:3].mm(R.t())
-    x[:,3:6] = x[:,3:6].mm(R.t())
-    x[:,6:] = x[:,6:].mm(R.t())
-    x[:,:3] += dV
-    
-    outputs,_,_ = net(x, mIdx, T.hfList, T.poolMats, T.dofs, T.Us, T.Lambdas, T.groupedLocalData)
+    if candidate.exists():
+        candidate.unlink()
+    model = SubdDispNet(params).to(device)
+    load_quantized_disp(model, checkpoint, device)
+    with torch.no_grad():
+        reconstructed = model(base, F=faces)
+        final_p2m, _, _ = point2mesh_error(
+            reconstructed, faces, reference, reference_faces,
+            sample_seed=seed, num_samples=p2m_samples)
+        final_normal = normal_error(
+            reconstructed, faces, reference, reference_faces,
+            sample_seed=seed, num_samples=int(params["stage2_normal_samples"]))
+    print("[Stage 2] best P2M %.6e | normal error %.4f deg | saved %s" % (
+        float(final_p2m), float(final_normal), checkpoint.name))
 
-    # write rotated outputs
-    for ii in range(len(outputs)):
-        x = outputs[ii].cpu()
-        tgp.writeOBJ(params['output_path'] + str(mIdx) +'_rot_subd' + str(ii) + '.obj',x, T.meshes[mIdx][ii].F.to('cpu'))
-        
-if __name__ == '__main__':
+
+def main():
+    parser = argparse.ArgumentParser(description='Train both AL_Q1 stages or a single stage.')
+    parser.add_argument("folder", help='Directory containing hyperparameters.json')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--stage1-only", action="store_true")
+    modes.add_argument("--stage2-only", action="store_true")
+    args = parser.parse_args()
+
+    folder = Path(args.folder).resolve()
+    with open(folder / "hyperparameters.json", "r", encoding="utf-8") as stream:
+        params = json.load(stream)
+    params["device"] = (
+        params["device"] if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+
+    stage1_epochs = int(params["stage1_epochs"])
+    stage2_epochs = int(params["stage2_epochs"])
+    if args.stage2_only:
+        train_stage2(params, folder, stage2_epochs)
+    elif args.stage1_only:
+        train_stage1(params, folder, stage1_epochs)
+    else:
+        train_stage1(params, folder, stage1_epochs)
+        train_stage2(params, folder, stage2_epochs)
+
+
+if __name__ == "__main__":
     main()
