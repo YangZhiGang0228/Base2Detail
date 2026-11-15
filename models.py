@@ -2,8 +2,49 @@ from include import *
 import torch.nn.functional as F
 import torch
 import numpy as np
-from sparse_loss import sparse_s_loss_sum_count
+import math
 
+
+def aggregate_cyclic_views(aligned, policy="all", view_offset=0, generator=None):
+    """Aggregate aligned one-ring predictions without changing their topology."""
+    if policy == "all":
+        return aligned.mean(dim=1)
+    if policy == "fixed":
+        return aligned[:, int(view_offset) % aligned.shape[1]]
+    if policy == "random":
+        batch = torch.arange(aligned.shape[0], device=aligned.device)
+        selected = torch.randint(
+            aligned.shape[1], (aligned.shape[0],), device=aligned.device,
+            generator=generator)
+        return aligned[batch, selected]
+    raise ValueError("stage1_view_policy must be 'all', 'fixed', or 'random'")
+
+
+def select_cyclic_views(flaps, policy="all", view_offset=0, generator=None,
+                        return_indices=False):
+    """Select cyclic one-ring starts before the expensive matrix networks."""
+    batch_size, view_count = flaps.shape[:2]
+    if policy == "all":
+        indices = torch.arange(view_count, device=flaps.device).view(1, -1)
+        indices = indices.expand(batch_size, -1)
+        selected = flaps
+    elif policy == "fixed":
+        indices = torch.full(
+            (batch_size, 1), int(view_offset) % view_count,
+            dtype=torch.long, device=flaps.device)
+        selected = flaps[
+            torch.arange(batch_size, device=flaps.device), indices[:, 0]
+        ].unsqueeze(1)
+    elif policy == "random":
+        indices = torch.randint(
+            view_count, (batch_size, 1), device=flaps.device,
+            generator=generator)
+        selected = flaps[
+            torch.arange(batch_size, device=flaps.device), indices[:, 0]
+        ].unsqueeze(1)
+    else:
+        raise ValueError("stage1_view_policy must be 'all', 'fixed', or 'random'")
+    return (selected, indices) if return_indices else selected
 
 class MLP(torch.nn.Module):
     def __init__(self, Din, Dhid, Dout):
@@ -13,39 +54,48 @@ class MLP(torch.nn.Module):
         for ii in range(len(Dhid)-1):
             self.hidden.append(torch.nn.Linear(Dhid[ii], Dhid[ii+1]))
         self.layerOut = torch.nn.Linear(Dhid[-1], Dout)
-        self.relu = torch.nn.ReLU()
+        self.act = torch.nn.SiLU() 
 
     def forward(self, x):
         x = self.layerIn(x)
-        x = self.relu(x)
+        x = self.act(x)
         for ii in range(len(self.hidden)):
             x = self.hidden[ii](x)
-            x = self.relu(x)
+            x = self.act(x)
         x = self.layerOut(x)
         return x
 
-class SubdNet(torch.nn.Module):
-    def __init__(self, params):
-        super(SubdNet, self).__init__()
-        self.Dout_feature = params['Dout']
-        self.numSubd = params["numSubd"]
-        self.D_lifted = params['Lifted']
-        self.PE_dim = 16
-        self.V_feat_dim = 9+self.D_lifted + 2*self.PE_dim
-        self.V_view_dim = 9+self.D_lifted+self.PE_dim
-        self.V_local_dim = self.D_lifted+self.Dout_feature
-        self.sparse_a = float(params.get("sparse_a", 1e-2))
-        
-        self.net_init = MLP(9 + 6, params['h_initNet'], self.Dout_feature)
-        self.net_lift = MLP(self.Dout_feature, params['h_liftNet'], self.D_lifted)
-        self.net_A = MLP(self.V_feat_dim, params['h_matrixNet'], 1)
-        self.net_L = MLP(self.V_feat_dim, params['h_matrixNet'], 1)
-        self.net_view_weight = MLP(self.V_view_dim, params['h_matrixNet'], 1)
-        self.net_feature = MLP(self.V_local_dim, params['h_FNet'], self.Dout_feature)
-        
+    def project_positions(self, positions, context_dim):
+        """Weight-dependent projection, shared only within this forward pass."""
+        return F.linear(positions, self.layerIn.weight[:, context_dim:])
+
+    def forward_context(self, context, position_hidden):
+        """Exactly the original first affine map, without repeating context."""
+        width = context.shape[-1]
+        common = F.linear(context, self.layerIn.weight[:, :width], self.layerIn.bias)
+        x = self.act(common.unsqueeze(-2) + position_hidden)
+        for layer in self.hidden:
+            x = self.act(layer(x))
+        return self.layerOut(x)
+
+def compute_vertex_normals(V, F):
+    vec1 = V[F[:, 1], :] - V[F[:, 0], :]
+    vec2 = V[F[:, 2], :] - V[F[:, 0], :]
+    FN = torch.cross(vec1, vec2, dim=-1)
+
+    VN = torch.zeros_like(V)
+    VN.index_add_(0, F[:, 0], FN)
+    VN.index_add_(0, F[:, 1], FN)
+    VN.index_add_(0, F[:, 2], FN)
+
+    vn_norm = torch.norm(VN, dim=1, keepdim=True)
+    VN = VN / (vn_norm + 1e-8)
+    return VN
+
+class SubdGeometricMixin(torch.nn.Module):
+    def __init__(self):
+        super(SubdGeometricMixin, self).__init__()
         self.pool = torch.nn.AvgPool2d((2,1)) 
-        
-        # 全局缓存拓扑索引，避免循环中重复创建
         self.topo_cache = {}
 
     def halfEdgePool(self, fhe):
@@ -54,8 +104,46 @@ class SubdNet(torch.nn.Module):
         fe = fe.squeeze(0).squeeze(0)
         return fe
 
+    def v2hf_flapNormalization(self, hf, normalizeFeature=False):
+        localFrames = self.flapNormalization(hf[:,:,:3])
+        hf_pos = hf[:,:,:3] - hf[:,:1,:3]
+        hf_pos = torch.bmm(hf_pos, localFrames.transpose(1, 2))
+        hf_feature = hf[:,:,3:]
+        if normalizeFeature:
+            hf_feature = torch.bmm(hf_feature, localFrames.transpose(1, 2))
+        return torch.cat((hf_pos, hf_feature), dim=2), localFrames
+
+    def v2hf(self, fv, hfIdx):
+        fv0 = fv[hfIdx[:,0],:].unsqueeze(1) 
+        fv1 = fv[hfIdx[:,1],:].unsqueeze(1) 
+        fv2 = fv[hfIdx[:,2],:].unsqueeze(1) 
+        fv3 = fv[hfIdx[:,3],:].unsqueeze(1) 
+        hf = torch.cat((fv0,fv1,fv2,fv3), dim=1) 
+
+        hf_normalize, localFrames = self.v2hf_flapNormalization(hf, False) 
+        hf_normalize = hf_normalize.view(hf_normalize.size(0), -1) 
+        hf_normalize = hf_normalize[:,3:] 
+        return hf_normalize, localFrames
+    
+    def v2hf_initNet(self, fv, hfIdx):
+        fv0 = fv[hfIdx[:,0],:].unsqueeze(1) 
+        fv1 = fv[hfIdx[:,1],:].unsqueeze(1) 
+        fv2 = fv[hfIdx[:,2],:].unsqueeze(1) 
+        fv3 = fv[hfIdx[:,3],:].unsqueeze(1) 
+        hf = torch.cat((fv0,fv1,fv2,fv3), dim=1) 
+
+        hf_normalize, localFrames = self.v2hf_flapNormalization(hf, True) 
+        hf_normalize = hf_normalize.view(hf_normalize.size(0), -1) 
+        hf_normalize = hf_normalize[:,3:] 
+        return hf_normalize, localFrames
+
+    def oneRingPool(self, fhe, poolMat, dof):
+        fv = torch.spmm(poolMat, fhe)
+        fv /= dof.unsqueeze(1) 
+        return fv
+
     def flapNormalization(self, hf_pos):
-        V = hf_pos 
+        V = hf_pos
         F = torch.tensor([[0,1,2],[1,0,3]], device=hf_pos.device) 
         b1 = (V[:,1,:] - V[:,0,:]) / (torch.norm(V[:,1,:] - V[:,0,:], dim=1).unsqueeze(1) + 1e-8)
         vec1 = V[:,F[:,1],:] - V[:,F[:,0],:]
@@ -85,193 +173,220 @@ class SubdNet(torch.nn.Module):
             
             self.topo_cache[key] = {
                 'cyclic_idx': cyclic_idx,
-                'triu_idx_A': torch.triu_indices(n+1, n+1, offset=1, device=device),
-                'triu_idx_L': torch.triu_indices(n+1, n+1, offset=0, device=device),
-                'diag_idx': torch.arange(1, n+1, device=device),
+                'triu_idx_L': torch.triu_indices(n+1, n+1, offset=1, device=device),
+                'diag_idx': torch.arange(0, n+1, device=device),
                 'j_gather': j_gather
             }
         return self.topo_cache[key]
 
-    def forward(self, fv, mIdx, HFs, poolMats, DOFs, Us, Lambdas, groupedLocalData):
-        outputs = []
-        consist_losses = []
-        device = fv.device
-        sparse_loss_sum = fv.new_tensor(0.0)
-        sparse_loss_count = 0
+
+class SubdBaseNet(SubdGeometricMixin):
+    def __init__(self, params):
+        super(SubdBaseNet, self).__init__()
+        self.Dout_feature = params['Dout']
+        self.numSubd = params["numSubd"]
+        self.group_batch = 4096
+        self.PE_dim = int(params['stage1_pe_dim'])
+        self.view_policy = params.get("stage1_view_policy", "all")
+        self.view_offset = int(params.get("stage1_view_offset", 0))
+        # Tiny groups are launch-bound: keep one original batched affine map.
+        self.context_reuse_min_views = 512
         
+        self.V_feat_dim = 9 + 4 * self.Dout_feature + 2 * self.PE_dim
+        
+        #self.net_init = MLP(4 * 6 - 3, params['h_initNet'], self.Dout_feature)
+        self.net_init = torch.nn.Linear(4 * 6 - 3,self.Dout_feature)
+        self.net_feature = MLP(4 * (3 + self.Dout_feature) - 3, params['h_FNet'], self.Dout_feature)
+        
+        self.net_L_diag = MLP(9 + 4 * self.Dout_feature + self.PE_dim, params['h_matrixNet'], 1)
+        self.net_L_triu = MLP(self.V_feat_dim, params['h_matrixNet'], 1)
+
+    def _degree_update(self, pos, curr_feat, v0_idx, flaps, Q_base, view_ids,
+                       diag_hidden, triu_hidden, pe):
+        flap_idx, selected = select_cyclic_views(
+            flaps, self.view_policy, self.view_offset, return_indices=True)
+        B, views, n = flap_idx.shape[:3]
+        if view_ids.dim() == 1:
+            view_ids = view_ids.view(1, n).expand(B, n)
+        view_indices = torch.gather(view_ids, 1, selected)
+        topo = self._get_topo_indices(n, pos.device)
+        reference = pos[flap_idx[:, :, 0, :]]
+        frames = self.flapNormalization(reference.reshape(B * views, 4, 3))
+        center = pos[v0_idx].view(B, 1, 1, 3)
+        neighbors = pos[flap_idx[:, :, :, 1]] - center
+        local_neighbors = torch.bmm(
+            neighbors.reshape(B * views, n, 3), frames.transpose(1, 2)
+        ).view(B, views, n, 3)
+        # Only the first half-flap supplies the 9D geometric context.
+        reference_local = torch.bmm(
+            (reference[:, :, 1:, :] - center).reshape(B * views, 3, 3),
+            frames.transpose(1, 2)).view(B, views, 9)
+        features = curr_feat[flap_idx[:, :, 0, :]].reshape(
+            B, views, 4 * self.Dout_feature)
+        context = torch.cat((reference_local, features), dim=-1)
+        r, c = topo['triu_idx_L']
+        if diag_hidden is None or B * views < self.context_reuse_min_views:
+            diagonal_input = torch.cat((context.unsqueeze(2).expand(B, views, n+1, -1),
+                                       pe.expand(B, views, n+1, -1)), dim=-1)
+            pair_pe = torch.cat((pe[r], pe[c]), dim=-1)
+            upper_input = torch.cat((context.unsqueeze(2).expand(B, views, len(r), -1),
+                                    pair_pe.expand(B, views, len(r), -1)), dim=-1)
+            raw_s = self.net_L_diag(diagonal_input.reshape(-1, diagonal_input.shape[-1])).view(B, views, n+1)
+            upper = self.net_L_triu(upper_input.reshape(-1, upper_input.shape[-1])).view(B, views, len(r))
+        else:
+            raw_s = self.net_L_diag.forward_context(context, diag_hidden).squeeze(-1)
+            upper = self.net_L_triu.forward_context(context, triu_hidden).squeeze(-1)
+        s = F.softplus(raw_s)
+        sums = s.flip(-1).cumsum(-1).flip(-1)
+        lambdas = torch.cat((torch.ones_like(sums[:, :, :1]),
+                             sums[:, :, 1:] / (sums[:, :, :1] + 1e-8)), dim=-1)
+        L = pos.new_zeros(B, views, n + 1, n + 1)
+        L[:, :, r, c] = upper
+        L[:, :, topo['diag_idx'], topo['diag_idx']] = lambdas
+        Q = Q_base.view(1, 1, n + 1, n + 1)
+        local = torch.cat((torch.zeros_like(local_neighbors[:, :, :1]),
+                           local_neighbors), dim=2)
+        # Q L Q^T X: associate with the three coordinate columns, not Q^T.
+        transformed = torch.matmul(Q, torch.matmul(L, torch.matmul(Q.transpose(-1, -2), local)))
+        global_out = torch.bmm(
+            transformed.reshape(B * views, n + 1, 3), frames
+        ).view(B, views, n + 1, 3) + center
+        gather = topo['j_gather'][view_indices].unsqueeze(-1).expand(B, views, n, 3)
+        aligned = torch.gather(global_out[:, :, 1:, :], 2, gather)
+        return torch.cat((global_out[:, :, :1, :], aligned), dim=2).mean(dim=1)
+
+    def forward(self, fv, mIdx, HFs, poolMats, DOFs, groupedLocalData,
+                return_features=True):
         pos = fv[:, :3]
-        
-        # ==================== Step 1: 初始特征提取 (Subd0) ====================
-        curr_feat = torch.zeros(pos.size(0), self.Dout_feature, device=device)
-        grouped_data_0 = groupedLocalData[mIdx][0] 
-        
-        for deg, data in grouped_data_0.items():
-            v0_idx, flap_idx = data['v0'], data['flap_idx']
-            B, n = v0_idx.size(0), deg
-            
-            VN_global = fv[v0_idx, 3:6]
-            LC_global = fv[v0_idx, 6:9]
-            
-            ref_hf_idx = flap_idx[:, :, 0, :] 
-            local_frames = self.flapNormalization(pos[ref_hf_idx].view(B*n, 4, 3)) 
-            
-            VN_global_exp = VN_global.unsqueeze(1).expand(B, n, 3).reshape(B*n, 1, 3)
-            LC_global_exp = LC_global.unsqueeze(1).expand(B, n, 3).reshape(B*n, 1, 3)
-            VN_local = torch.bmm(VN_global_exp, local_frames.transpose(1, 2)).view(B, n, 3)
-            LC_local = torch.bmm(LC_global_exp, local_frames.transpose(1, 2)).view(B, n, 3)
-            v0_6d = torch.cat([VN_local, LC_local], dim=-1) # (B, n, 6)
-            
-            v123_global = pos[flap_idx[:, :, 0, 1:4]] # 仅取第一个, 形状 (B, n, 3, 3)
-            v123_centered = v123_global - pos[v0_idx].view(B, 1, 1, 3)
-            v123_local_flat = torch.bmm(v123_centered.view(B*n, 3, 3), local_frames.transpose(1, 2))
-            v123_local = v123_local_flat.view(B, n, 9) # 展平为 (B, n, 9),n种坐标系
-            
-            local_init_input = torch.cat([v123_local, v0_6d], dim=-1) # (B, n, 15)，每个坐标系下只预测一次高维坐标
-            feat_init_flat = self.net_init(local_init_input.view(-1, local_init_input.shape[-1]))#(B * n, self.Dout_feature)
-            feat_init = feat_init_flat.view(B, n, self.Dout_feature)
-            
-            # 沿 n 个局部视角求平均
-            curr_feat[v0_idx] = feat_init.mean(dim=1)
-
-        outputs.append(pos)
-
-        # ==================== Step 2: 细分循环 ====================
-        for ii in range(self.numSubd):
-            nV_even = DOFs[mIdx][ii].size(0)
-            nHE = HFs[mIdx][ii].size(0)
-            
-            new_pos_even = torch.zeros(nV_even, 3, device=device)
-            new_feat_even = torch.zeros(nV_even, self.Dout_feature, device=device)
-            new_pos_odd_he = torch.zeros(nHE, 3, device=device)
-            new_feat_odd_he = torch.zeros(nHE, self.Dout_feature, device=device)
-            
-            grouped_data = groupedLocalData[mIdx][ii] 
-            
-            for deg, data in grouped_data.items():
-                v0_idx, flap_idx, he_idx = data['v0'], data['flap_idx'], data['he_idx']
-                pos_enc = data['pos_enc'] 
-                B, n = v0_idx.size(0), deg
-                neighbor_idx = flap_idx[:, :, :, 1] 
-                topo = self._get_topo_indices(n, device)
-                
-                ref_hf_pos = pos[flap_idx[:, :, 0, :]] 
-                local_frames = self.flapNormalization(ref_hf_pos.view(B*n, 4, 3))  
-
-                v1_centered = pos[neighbor_idx] - pos[v0_idx].view(B, 1, 1, 3)
-                v1_local_flat = torch.bmm(v1_centered.view(B*n, n, 3), local_frames.transpose(1, 2))
-                v1_local = v1_local_flat.view(B, n, n, 3)
-                v123_global = pos[flap_idx[:, :, :, 1:4]] 
-                v123_centered = v123_global - pos[v0_idx].view(B, 1, 1, 1, 3)
-                v123_local_flat = torch.bmm(v123_centered.view(B*n, n*3, 3), local_frames.transpose(1, 2))
-                v123_local = v123_local_flat.view(B, n, n, 9)
-                ref_9d_context = v123_local[:, :, 0, :]
-
-                feat_neighbor = curr_feat[neighbor_idx] #[B,n,n,Dout]
-                feat_v0 = curr_feat[v0_idx] #[B,Dout]
-                neighbor_idx_unique = flap_idx[:, 0, :, 1] #这里因为取maxpool且高维特征与坐标系无关所以只选取第0个坐标系
-                feat_neighbor_unique = curr_feat[neighbor_idx_unique] # (B, n, Dout)
-                combined_feat = torch.cat([feat_v0.unsqueeze(1), feat_neighbor_unique], dim=1) #（B,n+1,Dout)
-                combined_feat_high = self.net_lift(combined_feat.view(-1, self.Dout_feature)) #(B*n+1,Dout)
-                combined_feat_high = combined_feat_high.view(B, n + 1, self.D_lifted) # (B, n+1, D_lifted)
-                ring1_high = combined_feat_high.max(dim=1)[0] #(B,D_lifted)
-                updated_v0_feat = self.net_feature(torch.cat([ring1_high, feat_v0], dim=-1)) # (B, Dout)
-
-                pe_v0 = torch.zeros(B, 1, self.PE_dim, device=device) 
-                pos_enc_exp = pos_enc.unsqueeze(0).expand(B, n, self.PE_dim) # (B, n, PE_dim)
-                pe_all = torch.cat([pe_v0, pos_enc_exp], dim=1) # (B, n+1, PE_dim)
-                # 两两成对的顶点位置编码
-                pe_row = pe_all.unsqueeze(2).expand(B, n+1, n+1, self.PE_dim)
-                pe_col = pe_all.unsqueeze(1).expand(B, n+1, n+1, self.PE_dim)
-                pe_pairs = torch.cat([pe_row, pe_col], dim=-1) # (B, n+1, n+1, 2*PE_dim)
-
-                # ------ 预测矩阵 A ------
-                # 输入：当前坐标系下首个half-flap(9D) + 1环高维特征(D_lifted)
-                ctx_common = torch.cat([ref_9d_context, ring1_high.unsqueeze(1).expand(B, n, self.D_lifted)], dim=-1) # (B, n, 9+D_lifted)
-                
-                ctx_A_exp = ctx_common.view(B, n, 1, 1, -1).expand(B, n, n+1, n+1, 9 + self.D_lifted)
-                pe_pairs_exp = pe_pairs.unsqueeze(1).expand(B, n, n+1, n+1, 2 * self.PE_dim)
-                Pairs_A = torch.cat([ctx_A_exp, pe_pairs_exp], dim=-1) # (B, n, n+1, n+1, 9+D_lifted+2*PE_dim)
-
-                A_raw_flat = self.net_A(Pairs_A.view(-1, Pairs_A.shape[-1])) #(B*n*n+1*n+1,1)
-                A_raw = A_raw_flat.view(B, n, n+1, n+1).squeeze(-1)
-                A = torch.zeros(B, n, n+1, n+1, device=device)
-                A[:, :, topo['triu_idx_A'][0], topo['triu_idx_A'][1]] = A_raw[:, :, topo['triu_idx_A'][0], topo['triu_idx_A'][1]]
-                
-
-                ctx_L_exp = ctx_common.unsqueeze(2).expand(B, n, n, 9 + self.D_lifted)
-                pe_j_exp = pos_enc.unsqueeze(1).expand(B, n, n, self.PE_dim) 
-                Pairs_w = torch.cat([ctx_L_exp, pe_j_exp], dim=-1) # (B, n, n, 9+D_lifted+PE_dim)
-                view_weight_flat = self.net_view_weight((Pairs_w.view(-1, Pairs_w.shape[-1])))
-                perc_diag = torch.sigmoid(view_weight_flat.view(B, n, n)) # (B, n, n)
-                
-                # --- 预测矩阵 L ---
-                # L 使用与 A 相同的输入 Pairs_A
-                L_raw_flat = self.net_L(Pairs_A.view(-1, Pairs_A.shape[-1]))
-                L_raw = L_raw_flat.view(B, n, n+1, n+1).squeeze(-1)
-                L_mat = torch.zeros(B, n, n+1, n+1, device=device)
-                # 取严格上三角部分
-                L_mat[:, :, topo['triu_idx_A'][0], topo['triu_idx_A'][1]] = L_raw[:, :, topo['triu_idx_A'][0], topo['triu_idx_A'][1]]
-                # 计算对角线 1 到 n 的特征值
-                a_pred = L_raw[:, :, topo['diag_idx'], topo['diag_idx']] # (B, n, n)
-                a_relu = F.relu(a_pred)
-                a_cumsum = torch.cumsum(a_relu, dim=-1) # (B, n, n), 计算累加和 a1, a1+a2, a1+a2+a3...
-                epsilon = 1e-6
-                diag_vals = 1.0 / (1.0 + a_cumsum + epsilon) # 按照公式计算特征值
-                # 将计算好的特征值赋给 L 的对角线
-                diag_vals = diag_vals * perc_diag
-                L_mat[:, :, topo['diag_idx'], topo['diag_idx']] = diag_vals
-                L_mat[:, :, 0, 0] = 1.0 # 强制 [0,0] 为 1
-                
-                # --- 生成正交矩阵 Q 与细分矩阵 S ---
-                B_mat = A - A.transpose(2, 3) 
-                Q_flat = torch.matrix_exp(B_mat.view(B*n, n+1, n+1))   
-                Q = Q_flat.view(B, n, n+1, n+1)
-                S = torch.matmul(Q, torch.matmul(L_mat, Q.transpose(2, 3)))
-
-                s_sum, s_count = sparse_s_loss_sum_count(S, self.sparse_a)
-                sparse_loss_sum = sparse_loss_sum + s_sum
-                sparse_loss_count += s_count
-
-                V_in_local = torch.zeros(B, n, n+1, 3, device=device)
-                V_in_local[:, :, 1:, :] = v1_local 
-                V_out_local = torch.matmul(S, V_in_local)
-                V_out_local_flat = V_out_local.view(B*n, n+1, 3)
-                V_out_global_flat = torch.bmm(V_out_local_flat, local_frames)
-                V_out_global = V_out_global_flat.view(B, n, n+1, 3) + pos[v0_idx].view(B, 1, 1, 3)
-                
-                F_in_local = torch.zeros(B, n, n+1, self.Dout_feature, device=device)
-                F_in_local[:, :, 0, :] = updated_v0_feat.unsqueeze(1).expand(B, n, self.Dout_feature)
-                F_in_local[:, :, 1:, :] = feat_neighbor
-                F_out_local = torch.matmul(S, F_in_local)
-                
-                gather_idx_V = topo['j_gather'].view(1, n, n, 1).expand(B, n, n, 3)
-                V_aligned_flaps = torch.gather(V_out_global[:, :, 1:, :], 2, gather_idx_V)
-                V_aligned = torch.cat([V_out_global[:, :, 0:1, :], V_aligned_flaps], dim=2)
-                V_avg = V_aligned.mean(dim=1)
-                
-                gather_idx_F = topo['j_gather'].view(1, n, n, 1).expand(B, n, n, self.Dout_feature)
-                F_aligned_flaps = torch.gather(F_out_local[:, :, 1:, :], 2, gather_idx_F)
-                F_aligned = torch.cat([F_out_local[:, :, 0:1, :], F_aligned_flaps], dim=2)
-                F_avg = F_aligned.mean(dim=1)
-                
-                new_pos_even[v0_idx] = V_avg[:, 0, :]
-                new_feat_even[v0_idx] = F_avg[:, 0, :]
-                he_idx_flat = he_idx.flatten()
-                new_pos_odd_he[he_idx_flat] = V_avg[:, 1:, :].reshape(-1, 3)
-                new_feat_odd_he[he_idx_flat] = F_avg[:, 1:, :].reshape(-1, self.Dout_feature)
-
-            # 一致性损失
-            pred_pos_he0 = new_pos_odd_he[0::2]
-            pred_pos_he1 = new_pos_odd_he[1::2]
-            loss_pos_consist = F.mse_loss(pred_pos_he0, pred_pos_he1)
-            consist_losses.append(loss_pos_consist)
-
-            # 池化更新迭代
-            pos = torch.cat([new_pos_even, self.halfEdgePool(new_pos_odd_he)], dim=0)
-            curr_feat = torch.cat([new_feat_even, self.halfEdgePool(new_feat_odd_he)], dim=0)
+        fhf, _ = self.v2hf_initNet(fv, HFs[mIdx][0])
+        curr_feat = self.oneRingPool(self.net_init(fhf), poolMats[mIdx][0], DOFs[mIdx][0])
+        outputs = [pos]
+        for level in range(self.numSubd):
+            nV, nHE = DOFs[mIdx][level].size(0), HFs[mIdx][level].size(0)
+            even, odd = pos.new_zeros(nV, 3), pos.new_zeros(nHE, 3)
+            need_features = return_features or level + 1 < self.numSubd
+            next_features = None
+            if need_features:
+                fhf, _ = self.v2hf(torch.cat((pos, curr_feat), dim=1), HFs[mIdx][level])
+                updated = self.net_feature(fhf)
+                next_features = torch.cat((
+                    self.oneRingPool(updated, poolMats[mIdx][level], DOFs[mIdx][level]),
+                    self.halfEdgePool(updated)), dim=0)
+            for degree, data in groupedLocalData[mIdx][level].items():
+                topo = self._get_topo_indices(degree, pos.device)
+                pe = torch.cat((data['pos_enc'].new_zeros(1, self.PE_dim),
+                                data['pos_enc']), dim=0)
+                r, c = topo['triu_idx_L']
+                context_dim = 9 + 4 * self.Dout_feature
+                # These projections depend on trainable weights: rebuild each forward.
+                views = degree if self.view_policy == 'all' else 1
+                diag_hidden, triu_hidden = None, None
+                if len(data['v0']) * views >= self.context_reuse_min_views:
+                    diag_hidden = self.net_L_diag.project_positions(pe, context_dim)
+                    triu_hidden = self.net_L_triu.project_positions(
+                        torch.cat((pe[r], pe[c]), dim=-1), context_dim)
+                batch = getattr(self, 'group_batch', None) or len(data['v0'])
+                view_ids = data.get('view_ids', torch.arange(degree, device=pos.device))
+                for start in range(0, len(data['v0']), batch):
+                    stop = start + batch
+                    ids = view_ids if view_ids.dim() == 1 else view_ids[start:stop]
+                    args = (pos, curr_feat, data['v0'][start:stop],
+                            data['flap_idx'][start:stop], data['Q'], ids,
+                            diag_hidden, triu_hidden, pe)
+                    if torch.is_grad_enabled() and getattr(self, 'use_checkpoint', False):
+                        from torch.utils.checkpoint import checkpoint
+                        average = checkpoint(self._degree_update, *args, use_reentrant=False)
+                    else:
+                        average = self._degree_update(*args)
+                    even[data['v0'][start:stop]] = average[:, 0, :]
+                    odd[data['he_idx'][start:stop].flatten()] = average[:, 1:, :].reshape(-1, 3)
+            pos = torch.cat((even, self.halfEdgePool(odd)), dim=0)
+            curr_feat = next_features
             outputs.append(pos)
+        return outputs, curr_feat
 
-        total_consist_loss = sum(consist_losses) if consist_losses else 0.0
-        sparse_loss = sparse_loss_sum / sparse_loss_count
+class SharedVertexMLP(torch.nn.Module):
 
-        return outputs, total_consist_loss, sparse_loss
+    def __init__(self, widths):
+        super(SharedVertexMLP, self).__init__()
+        self.widths = [int(width) for width in widths]
+        widths = self.widths
+        self.layer1 = torch.nn.Linear(widths[0], widths[1])
+        self.layer2 = torch.nn.Linear(widths[1], widths[2])
+        self.layer3 = torch.nn.Linear(widths[2], widths[3])
+        self.output = torch.nn.Linear(widths[3], widths[4])
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        with torch.no_grad():
+            self.layer1.weight.uniform_(
+                -1.0 / self.layer1.in_features, 1.0 / self.layer1.in_features)
+            self.layer1.bias.zero_()
+            for layer in (self.layer2, self.layer3):
+                bound = math.sqrt(6.0 / layer.in_features)
+                layer.weight.uniform_(-bound, bound)
+                layer.bias.zero_()
+            self.output.weight.zero_()
+            self.output.bias.zero_()
+
+    def forward(self, features):
+        hidden = torch.sin(30.0 * self.layer1(features))
+        hidden = hidden + torch.sin(self.layer2(hidden))
+        hidden = torch.sin(self.layer3(hidden))
+        return self.output(hidden)
+
+
+class SubdDispNet(torch.nn.Module):
+
+    def __init__(self, params):
+        super(SubdDispNet, self).__init__()
+        self.feature_mode = params.get('disp_feature_mode', 'fourier')
+        self.n_anchor = int(params['disp_n_anchor'])
+        self.anchor_pe_dim = int(params['disp_anchor_pe_dim'])
+        self.frequency_count = self.anchor_pe_dim // 2
+        if self.feature_mode == 'raw_distance':
+            self.input_width = self.n_anchor
+        elif self.feature_mode == 'fourier':
+            if self.anchor_pe_dim <= 0 or self.anchor_pe_dim % 2:
+                raise ValueError('disp_anchor_pe_dim must be a positive even number')
+            self.input_width = self.n_anchor * self.anchor_pe_dim
+        else:
+            raise ValueError('unsupported disp_feature_mode: ' + self.feature_mode)
+        self.register_buffer(
+            'anchor_idx', torch.zeros(self.n_anchor, dtype=torch.long))
+        self.register_buffer('anchor_ready', torch.zeros(1, dtype=torch.bool))
+        self.net_disp = SharedVertexMLP(
+            [self.input_width] + list(params['h_disp']) + [1])
+        self.output_scale = 1.0
+
+    def select_anchors(self, pos):
+        distance_to_center = (pos - pos.mean(dim=0, keepdim=True)).norm(dim=1)
+        anchors = [int(torch.argmax(distance_to_center))]
+        nearest = (pos - pos[anchors[0]]).norm(dim=1)
+        for _ in range(1, self.n_anchor):
+            nearest[anchors] = -1.0
+            picked = int(torch.argmax(nearest))
+            anchors.append(picked)
+            nearest = torch.minimum(nearest, (pos - pos[picked]).norm(dim=1))
+        return torch.tensor(anchors, dtype=torch.long, device=pos.device)
+
+    def anchor_features(self, pos):
+        if not bool(self.anchor_ready.item()):
+            self.anchor_idx.copy_(self.select_anchors(pos.detach()))
+            self.anchor_ready.fill_(True)
+        distance = (pos[:, None, :] - pos[self.anchor_idx][None, :, :]).norm(dim=2)
+        distance = distance - distance.mean(dim=0, keepdim=True)
+        distance = distance / distance.std(
+            dim=0, keepdim=True, unbiased=False).clamp_min(1e-8)
+        if self.feature_mode == 'raw_distance':
+            return distance
+        frequency = 2.0 ** torch.arange(
+            self.frequency_count, device=pos.device, dtype=torch.float64)
+        phase = math.pi * distance.to(torch.float64)[:, :, None] * frequency
+        return torch.cat((torch.sin(phase), torch.cos(phase)), dim=2).reshape(
+            len(pos), self.input_width).to(pos.dtype)
+
+    def forward(self, pos, F=None, **kwargs):
+        normal = compute_vertex_normals(pos, F)
+        displacement = self.net_disp(self.anchor_features(pos)) * self.output_scale
+        return pos + displacement * normal
