@@ -15,7 +15,7 @@ NETWORK_SIZE_PROFILES = {
 def main():
     parser = argparse.ArgumentParser(description="Write AL_Q1 training hyperparameters.")
     parser.add_argument("--train-pkl")
-    parser.add_argument("--output", default="./jobs/net_cartoon_elephant/")
+    parser.add_argument("--output", default="./results/")
     parser.add_argument("--levels", type=int, default=3)
     args = parser.parse_args()
 
