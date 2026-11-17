@@ -5,9 +5,10 @@ from pathlib import Path
 import torch
 
 from base_checkpoint import BASE_CHECKPOINT, load_base_checkpoint
-from include import TestMeshes, tgp
+from include import load_coarse_mesh
 from models import SubdBaseNet, SubdDispNet
 from stage2_checkpoint import STAGE2_QUANTIZED_CHECKPOINT, load_quantized_disp
+from tools.writeOBJ import writeOBJ
 
 
 def main():
@@ -30,7 +31,7 @@ def main():
     depth = int(params["numSubd"])
     weights, normalization = load_base_checkpoint(
         folder / BASE_CHECKPOINT, require_normalization=True)
-    meshes = TestMeshes([str(args.mesh)], depth, transforms=[normalization])
+    meshes = load_coarse_mesh(args.mesh, depth, normalization)
     meshes.computeParameters(int(params["stage1_pe_dim"]))
     meshes.toDevice(device)
 
@@ -56,7 +57,7 @@ def main():
     scale = meshes.transforms[0]["scale"].cpu()
     for level, vertices in enumerate(outputs):
         path = folder / f"{args.mesh.stem}_subd{level}.obj"
-        tgp.writeOBJ(str(path), vertices.cpu() * scale + center, mesh[level].F.cpu())
+        writeOBJ(str(path), vertices.cpu() * scale + center, mesh[level].F.cpu())
 
     print(f"Reconstruction results saved to {folder}")
 
