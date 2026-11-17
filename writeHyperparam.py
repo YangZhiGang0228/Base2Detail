@@ -15,7 +15,6 @@ NETWORK_SIZE_PROFILES = {
 def main():
     parser = argparse.ArgumentParser(description="Write AL_Q1 training hyperparameters.")
     parser.add_argument("--train-pkl")
-    parser.add_argument("--valid-pkl", help="Validation hierarchy cache. Defaults to the training cache when --train-pkl is set.")
     parser.add_argument("--output", default="./jobs/net_cartoon_elephant/")
     parser.add_argument("--levels", type=int, default=3)
     args = parser.parse_args()
@@ -23,7 +22,6 @@ def main():
     data = {
         "model_name": "bimba",
         "train_pkl": args.train_pkl or "./data_PKL/cartoon_elephant_train.pkl",
-        "valid_pkl": args.valid_pkl or args.train_pkl or "./data_PKL/cartoon_elephant_valid.pkl",
         "output_path": args.output,
         "device": "cuda",
         "seed": 2026,
@@ -37,7 +35,7 @@ def main():
         "stage1_epochs": 25000,
         "lr": 2e-3,
         "stage1_eta_min": 0.0,
-        "stage1_valid_eval_every": 10,
+        "stage1_eval_every": 10,
         "stage1_log_every": 100,
         "stage2_mesh_index": 0,
         "disp_n_anchor": 8,
