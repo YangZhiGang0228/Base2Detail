@@ -1,35 +1,16 @@
-import os
-import sys
-cwd = os.getcwd()
-sys.path.append(cwd + '/pythongptoolbox/')
-sys.path.append(cwd + '/torchgptoolbox_nosparse/')
-
-# torch
-import torch
-import torchgptoolbox_nosparse as tgp
-
-# pygptoolbox
-from readOBJ import readOBJ
-from writeOBJ import writeOBJ
-from findIdx import findIdx
-from midPointUpsampling import midPointUpsampling
-
-# python standard 
-import numpy as np
-import scipy
-import scipy.sparse
-import glob
-import time
-import json
-import pickle as pickle
 import math
+import os
+from pathlib import Path
 
-def compute_positional_encoding(degree, d_model=16):
-    """
-    计算一环邻域的相对位置编码 (基于之前的高频傅里叶特征公式)
-    degree: 当前中心顶点的度数 (邻居个数)，即公式中的 n
-    d_model: 位置编码的总维度大小 (16 对应指数 k 到 7)
-    """
+import numpy as np
+import torch
+
+from tools.midPointUpsampling import midPointUpsampling
+from tools.readOBJ import readOBJ
+
+def compute_positional_encoding(degree, d_model):
+    if d_model < 2 or d_model % 2:
+        raise ValueError('position-encoding dimension must be positive and even')
     pe = torch.zeros(degree, d_model)
     i_idx = torch.arange(0, degree, dtype=torch.float)
     base_angle = (i_idx + 1.0) * 2.0 * math.pi / degree
@@ -43,37 +24,26 @@ def compute_positional_encoding(degree, d_model=16):
     pe[:, 1::2] = torch.cos(angles)
     return pe
 
-def compute_loop_eigenvalues(k):
-        def get_loop_matrix(n):
-            cos_term = 3/8 + 0.25 * np.cos(2 * np.pi / n)
-            beta = (5/8 - cos_term**2) / n
-            M = torch.zeros((n + 1, n + 1), dtype=torch.float64)
-            
-            M[0, 0] = 1 - n * beta
-            M[0, 1:] = beta
-            
-            for i in range(1, n + 1):
-                M[i, 0] = 3/8  
-                M[i, i] = 3/8  
-                prev = (i - 2) % n + 1
-                nxt = i % n + 1
-                M[i, prev] = 1/8
-                M[i, nxt] = 1/8
-            return M
-        m = get_loop_matrix(k)
-        return m
-
-def compute_U_matrix(d):
-    N = d + 1
-    U = torch.zeros((N, N), dtype=torch.float32)
-    k = torch.arange(1, N + 1, dtype=torch.float32)
-    x = torch.cos((2 * k - 1) / (2 * N) * math.pi)
-    U[:, 0] = 1.0      
-    if N > 1:
-        U[:, 1] = x         
-    for m in range(2, N):
-        U[:, m] = 2 * x * U[:, m-1] - U[:, m-2]
-    return U
+def compute_Q_matrix(n):
+    Q = torch.zeros((n+1, n+1), dtype=torch.float32)
+    Q[:, 0] = 1.0 / math.sqrt(n+1)
+    Q[0, 1] = math.sqrt(n / (n+1))
+    Q[1:, 1] = -1.0 / math.sqrt(n * (n+1))
+    
+    col = 2
+    for k in range(1, n // 2 + 1):
+        if k == n / 2 and n % 2 == 0:
+            for j in range(n):
+                Q[j+1, col] = (1.0 / math.sqrt(n)) * math.cos(math.pi * j)
+            col += 1
+        else:
+            for j in range(n):
+                Q[j+1, col] = math.sqrt(2.0 / n) * math.cos(2 * math.pi * k * j / n)
+            col += 1
+            for j in range(n):
+                Q[j+1, col] = math.sqrt(2.0 / n) * math.sin(2 * math.pi * k * j / n)
+            col += 1
+    return Q
 
 class Mesh: 
     def __init__(self, V, F, hfList):
@@ -82,63 +52,62 @@ class Mesh:
         self.hfList = hfList
 
 def processTrainShapes(folder):
-    subFolders = os.listdir(folder)
-    subFolders = [x for x in subFolders if not (x.startswith('.'))]
-    nSubd = len(subFolders) - 1
-    objPaths = glob.glob(folder + subFolders[0] + "/*.obj")
-    nObjs = len(objPaths)
-    paths = []
-    for ii in range(nSubd + 1):
-        paths.append(folder + 'subd' + str(ii) + '/')
-    objFiles = []
-    for ii in range(nObjs):
-        objFiles.append(str(ii + 1).zfill(3))
-    meshes = [None] * nObjs
-    for ii in range(nObjs):
-        print('process meshes %d / %d' % (ii, nObjs))
-        meshes_i = [None] * (nSubd + 1)
-        for jj in range(nSubd + 1):
-            V, F = tgp.readOBJ(paths[jj] + objFiles[ii] + '.obj')
-            _, hfList = computeFlapList(V, F, 1)
-            meshes_i[jj] = Mesh(V, F, hfList[0])
-        meshes[ii] = list(meshes_i)
-    print('num Subd: %d, num meshes: %d' % (nSubd, nObjs))
-    return meshes
+    folder = Path(folder)
+    levels = sorted(
+        int(path.name[4:]) for path in folder.iterdir()
+        if path.is_dir() and path.name.startswith("subd") and path.name[4:].isdigit()
+    )
+    if len(levels) < 2 or levels != list(range(levels[-1] + 1)):
+        raise ValueError("Expected contiguous subdivision folders starting with subd0 and subd1.")
 
-class TrainMeshes: 
-    def __init__(self, folders):
-        nShape = len(folders)
-        self.meshes = []
-        for fIdx in range(nShape):
-            meshes = processTrainShapes(folders[fIdx])
-            for ii in range(len(meshes)):
-                self.meshes.append(meshes[ii])
+    coarse_files = list((folder / "subd0").glob("*.obj"))
+    if len(coarse_files) != 1:
+        raise ValueError(f"Expected exactly one coarse OBJ in {folder / 'subd0'}.")
+    name = coarse_files[0].name
+    reference_path = folder / "original" / name
+    if not reference_path.is_file():
+        raise FileNotFoundError(f"Missing original reference mesh: {reference_path}")
+
+    vertices, faces = readOBJ(reference_path)
+    maximum = vertices.max(dim=0).values
+    minimum = vertices.min(dim=0).values
+    center = (maximum + minimum) / 2.0
+    scale = (maximum - minimum).max() / 2.0
+    if scale == 0:
+        scale = 1e-5
+    normalization = {"center": center, "scale": scale}
+    reference = Mesh((vertices - center) / scale, faces, None)
+
+    hierarchy = []
+    for level in levels:
+        mesh_path = folder / f"subd{level}" / name
+        if not mesh_path.is_file():
+            raise FileNotFoundError(f"Missing subdivision level: {mesh_path}")
+        vertices, faces = readOBJ(mesh_path)
+        vertices = (vertices - center) / scale
+        _, half_flaps = computeFlapList(vertices, faces, 0)
+        hierarchy.append(Mesh(vertices, faces, half_flaps[0]))
+
+    print(f"Prepared {name} with {levels[-1]} subdivision levels.")
+    return [hierarchy], [normalization], [reference]
+
+
+class TrainMeshes:
+    def __init__(self, folder):
+        self.meshes, self.transforms, self.orig_meshes = processTrainShapes(folder)
         self.nM = len(self.meshes)
         self.nS = len(self.meshes[0])
         self.hfList = None
         self.poolMats = None
         self.dofs = None
         self.LCs = None
-        self.VNs = None  # 新增法向存储变量
-        self.Us = None       
-        self.Lambdas = None
+        #self.VNs = None  
         self.groupedLocalData = None
 
-    def getVertexNormals(self):
-        """单独计算所有 mesh 的顶点法向"""
-        VNs = [None] * self.nM
-        for mIdx in range(self.nM):
-            V = self.meshes[mIdx][0].V
-            F = self.meshes[mIdx][0].F
-            VN = tgp.vertexNormals(V, F)
-            VNs[mIdx] = VN
-        return VNs
-
     def getInputData(self, mIdx):
-        # 拼接全局特征: 坐标 + 法向 + 微分坐标
         input = torch.cat((
             self.meshes[mIdx][0].V,
-            self.VNs[mIdx],
+            #self.VNs[mIdx],
             self.LCs[mIdx]),
             dim=1)
         return input
@@ -146,8 +115,8 @@ class TrainMeshes:
     def getHalfFlap(self):
         HF = [None] * self.nM
         for ii in range(self.nM):
-            fifj = [None] * (self.nS - 1)
-            for jj in range(self.nS - 1):
+            fifj = [None] * (self.nS)
+            for jj in range(self.nS):
                 idx = self.meshes[ii][jj].hfList[:, [0, 1, 2, 3]]
                 fifj[jj] = idx.reshape(-1, 4)
             HF[ii] = list(fifj)
@@ -168,7 +137,7 @@ class TrainMeshes:
                 cIdx = torch.arange(hfIdx.size(0))
                 I = torch.cat([rIdx, cIdx], 0).reshape(2, -1)
                 val = torch.ones(hfIdx.size(0))
-                poolMat = torch.sparse.FloatTensor(I, val, torch.Size([nV, hfIdx.size(0)]))
+                poolMat = torch.sparse_coo_tensor(I, val, torch.Size([nV, hfIdx.size(0)]), dtype=val.dtype, device=val.device)
                 rowSum = torch.sparse.sum(poolMat, dim=1).to_dense()
                 poolFlap_ij[jj] = poolMat
                 dof_ij[jj] = rowSum
@@ -189,51 +158,11 @@ class TrainMeshes:
             LC[mIdx] = dV_v
         return LC
 
-    def get_U_and_Lambda(self, dofs):
-        Us_all = [None] * self.nM
-        Lambdas_all = [None] * self.nM
-        for mIdx in range(self.nM):
-            n_levels = len(dofs[mIdx])
-            Us_m = [None] * n_levels
-            Lambdas_m = [None] * n_levels
-            prev_U_exact = None
-            prev_Lambda_exact = None
-            for jj in range(n_levels):
-                dof = dofs[mIdx][jj].long()
-                nV = dof.size(0)
-                max_d = dof.max().item()
-                U_tensor = torch.zeros(nV, max_d + 1, max_d + 1)
-                Lambda_tensor = torch.zeros(nV, max_d + 1, max_d + 1)
-                if jj == 0:
-                    for i in range(nV):
-                        d = dof[i].item()
-                        U_tensor[i, :d+1, :d+1] = compute_U_matrix(d)
-                        Lambda_tensor[i, :d+1, :d+1] = compute_loop_eigenvalues(d)
-                else:
-                    nV_prev = dofs[mIdx][jj-1].size(0)
-                    max_d_prev = prev_U_exact.size(1) - 1
-                    min_max_d = min(max_d, max_d_prev)
-                    U_tensor[:nV_prev, :min_max_d+1, :min_max_d+1] = \
-                        prev_U_exact[:nV_prev, :min_max_d+1, :min_max_d+1] 
-                    Lambda_tensor[:nV_prev, :min_max_d+1, :min_max_d+1] = \
-                        prev_Lambda_exact[:nV_prev, :min_max_d+1, :min_max_d+1]
-                    for i in range(nV_prev, nV):
-                        d = dof[i].item()
-                        U_tensor[i, :d+1, :d+1] = compute_U_matrix(d)
-                        Lambda_tensor[i, :d+1, :d+1] = compute_loop_eigenvalues(d)
-                prev_U_exact = U_tensor.clone()
-                prev_Lambda_exact = Lambda_tensor.clone()
-                Us_m[jj] = U_tensor
-                Lambdas_m[jj] = Lambda_tensor
-            Us_all[mIdx] = Us_m
-            Lambdas_all[mIdx] = Lambdas_m
-        return Us_all, Lambdas_all
-
-    def getGroupedLocalPatches(self, hfList):
+    def getGroupedLocalPatches(self, hfList, pe_dim):
         grouped_data = [None] * self.nM
         for mIdx in range(self.nM):
-            grouped_data_m = [None] * (self.nS - 1)
-            for jj in range(self.nS - 1):
+            grouped_data_m = [None] * (self.nS)
+            for jj in range(self.nS):
                 HF = hfList[mIdx][jj]
                 nV = HF[:, 0].max().item() + 1
                 v_flaps_idx = {i: [] for i in range(nV)}
@@ -271,8 +200,8 @@ class TrainMeshes:
                     
                     if degree not in deg_dict:
                         deg_dict[degree] = {'v0': [], 'flap_idx': [], 'he_idx': []}
-                        # 注入相对位置编码
-                        deg_dict[degree]['pos_enc'] = compute_positional_encoding(degree, d_model=16)
+                        deg_dict[degree]['pos_enc'] = compute_positional_encoding(degree, pe_dim)
+                        deg_dict[degree]['Q'] = compute_Q_matrix(degree)
                     
                     deg_dict[degree]['v0'].append(v0)
                     deg_dict[degree]['flap_idx'].append(flap_indices_all_views)
@@ -287,43 +216,66 @@ class TrainMeshes:
             grouped_data[mIdx] = grouped_data_m
         return grouped_data
 
-    def computeParameters(self):
+    def computeParameters(self, pe_dim):
         self.hfList = self.getHalfFlap()
         self.poolMats, self.dofs = self.getFlapPool(self.hfList)
         self.LCs = self.getLaplaceCoordinate(self.hfList, self.poolMats, self.dofs)
-        self.VNs = self.getVertexNormals() # <--- 新增
-        self.Us, self.Lambdas = self.get_U_and_Lambda(self.dofs)
-        self.groupedLocalData = self.getGroupedLocalPatches(self.hfList)
+        #self.VNs = self.getVertexNormals() 
+        self.groupedLocalData = self.getGroupedLocalPatches(self.hfList, pe_dim)
 
     def toDevice(self, device):
         for ii in range(self.nM):
+            self.orig_meshes[ii].V = self.orig_meshes[ii].V.to(device)
+            self.orig_meshes[ii].F = self.orig_meshes[ii].F.to(device)
+            
             for jj in range(self.nS):
-                self.meshes[ii][jj].V = self.meshes[ii][jj].V.to(device)
+                if jj == 0:
+                    self.meshes[ii][jj].V = self.meshes[ii][jj].V.to(device)
                 self.meshes[ii][jj].F = self.meshes[ii][jj].F.to(device)
         for ii in range(self.nM):
             self.LCs[ii] = self.LCs[ii].to(device)
-            self.VNs[ii] = self.VNs[ii].to(device) # <--- 新增
-            for jj in range(self.nS - 1):
+            for jj in range(self.nS):
                 self.hfList[ii][jj] = self.hfList[ii][jj].to(device)
                 self.poolMats[ii][jj] = self.poolMats[ii][jj].to(device)
                 self.dofs[ii][jj] = self.dofs[ii][jj].to(device)
-                self.Us[ii][jj] = self.Us[ii][jj].to(device)
-                self.Lambdas[ii][jj] = self.Lambdas[ii][jj].to(device)
-                
                 deg_dict = self.groupedLocalData[ii][jj]
                 for deg in deg_dict:
                     deg_dict[deg]['v0'] = deg_dict[deg]['v0'].to(device)
                     deg_dict[deg]['flap_idx'] = deg_dict[deg]['flap_idx'].to(device)
                     deg_dict[deg]['he_idx'] = deg_dict[deg]['he_idx'].to(device)
                     if 'pos_enc' in deg_dict[deg]:
-                        deg_dict[deg]['pos_enc'] = deg_dict[deg]['pos_enc'].to(device) # <--- 新增
+                        deg_dict[deg]['pos_enc'] = deg_dict[deg]['pos_enc'].to(device)
+                    if 'Q' in deg_dict[deg]:
+                        deg_dict[deg]['Q'] = deg_dict[deg]['Q'].to(device)
 
-def preprocessTestShapes(meshPathList, nSubd=2):
+def preprocessTestShapes(meshPathList, nSubd=2, transforms=None):
     nObjs = len(meshPathList)
     meshes = [None] * nObjs
+    if transforms is not None and len(transforms) != nObjs:
+        raise ValueError("Expected one normalization transform per mesh.")
+    mesh_transforms = [] if transforms is None else list(transforms)
+    orig_meshes = []
+
     for meshIdx in range(nObjs):
         path = meshPathList[meshIdx]
-        V, F = tgp.readOBJ(path)
+        V, F = readOBJ(path)
+        if transforms is None:
+            base_dir = os.path.dirname(os.path.dirname(path))
+            orig_path = os.path.join(base_dir, 'original', os.path.basename(path))
+            V_orig, F_orig = readOBJ(orig_path) if os.path.exists(orig_path) else (V, F)
+            V_max = V_orig.max(dim=0).values
+            V_min = V_orig.min(dim=0).values
+            center = (V_max + V_min) / 2.0
+            scale = (V_max - V_min).max() / 2.0
+            if scale == 0:
+                scale = 1e-5
+            mesh_transforms.append({'center': center, 'scale': scale})
+            orig_meshes.append(Mesh((V_orig - center) / scale, F_orig, None))
+        else:
+            center = mesh_transforms[meshIdx]['center']
+            scale = mesh_transforms[meshIdx]['scale']
+        V = (V - center) / scale
+        
         FList, hfList = computeFlapList(V, F, nSubd)
         meshes_i = [None] * (nSubd + 1)
         for jj in range(nSubd + 1):
@@ -332,39 +284,27 @@ def preprocessTestShapes(meshPathList, nSubd=2):
             else:
                 meshes_i[jj] = Mesh(None, FList[jj], hfList[jj])
         meshes[meshIdx] = list(meshes_i)
+        
     print('num Subd: %d, num meshes: %d' % (nSubd, nObjs))
-    return meshes
+    return meshes, mesh_transforms, orig_meshes
 
 class TestMeshes:
-    def __init__(self, meshPathList, nSubd=2):
-        nShape = len(meshPathList)
-        self.meshes = preprocessTestShapes(meshPathList, nSubd)
+    def __init__(self, meshPathList, nSubd=2, *, transforms=None):
+        self.meshes, self.transforms, self.orig_meshes = preprocessTestShapes(
+            meshPathList, nSubd, transforms)
         self.nM = len(self.meshes)
         self.nS = len(self.meshes[0])
         self.hfList = None
         self.poolMats = None
         self.dofs = None
         self.LCs = None
-        self.VNs = None # 新增法向存储变量
-        self.Us = None       
-        self.Lambdas = None
+        #self.VNs = None 
         self.groupedLocalData = None
 
-    def getVertexNormals(self):
-        """单独计算所有 mesh 的顶点法向"""
-        VNs = [None] * self.nM
-        for mIdx in range(self.nM):
-            V = self.meshes[mIdx][0].V
-            F = self.meshes[mIdx][0].F
-            VN = tgp.vertexNormals(V, F)
-            VNs[mIdx] = VN
-        return VNs
-
     def getInputData(self, mIdx):
-        # 拼接全局特征: 坐标 + 法向 + 微分坐标
         input = torch.cat((
             self.meshes[mIdx][0].V,
-            self.VNs[mIdx],
+            #self.VNs[mIdx],
             self.LCs[mIdx]),
             dim=1)
         return input
@@ -372,8 +312,8 @@ class TestMeshes:
     def getHalfFlap(self):
         HF = [None] * self.nM
         for ii in range(self.nM):
-            fifj = [None] * (self.nS - 1)
-            for jj in range(self.nS - 1):
+            fifj = [None] * (self.nS)
+            for jj in range(self.nS):
                 idx = self.meshes[ii][jj].hfList[:, [0, 1, 2, 3]]
                 fifj[jj] = idx.reshape(-1, 4)
             HF[ii] = list(fifj)
@@ -415,51 +355,11 @@ class TestMeshes:
             LC[mIdx] = dV_v
         return LC
 
-    def get_U_and_Lambda(self, dofs):
-        Us_all = [None] * self.nM
-        Lambdas_all = [None] * self.nM
-        for mIdx in range(self.nM):
-            n_levels = len(dofs[mIdx])
-            Us_m = [None] * n_levels
-            Lambdas_m = [None] * n_levels
-            prev_U_exact = None
-            prev_Lambda_exact = None
-            for jj in range(n_levels):
-                dof = dofs[mIdx][jj].long()
-                nV = dof.size(0)
-                max_d = dof.max().item()
-                U_tensor = torch.zeros(nV, max_d + 1, max_d + 1)
-                Lambda_tensor = torch.zeros(nV, max_d + 1, max_d + 1)
-                if jj == 0:
-                    for i in range(nV):
-                        d = dof[i].item()
-                        U_tensor[i, :d+1, :d+1] = compute_U_matrix(d)
-                        Lambda_tensor[i, :d+1, :d+1] = compute_loop_eigenvalues(d)
-                else:
-                    nV_prev = dofs[mIdx][jj-1].size(0)
-                    max_d_prev = prev_U_exact.size(1) - 1
-                    min_max_d = min(max_d, max_d_prev)
-                    U_tensor[:nV_prev, :min_max_d+1, :min_max_d+1] = \
-                        prev_U_exact[:nV_prev, :min_max_d+1, :min_max_d+1] 
-                    Lambda_tensor[:nV_prev, :min_max_d+1, :min_max_d+1] = \
-                        prev_Lambda_exact[:nV_prev, :min_max_d+1, :min_max_d+1]
-                    for i in range(nV_prev, nV):
-                        d = dof[i].item()
-                        U_tensor[i, :d+1, :d+1] = compute_U_matrix(d)
-                        Lambda_tensor[i, :d+1, :d+1] = compute_loop_eigenvalues(d)
-                prev_U_exact = U_tensor.clone()
-                prev_Lambda_exact = Lambda_tensor.clone()
-                Us_m[jj] = U_tensor
-                Lambdas_m[jj] = Lambda_tensor
-            Us_all[mIdx] = Us_m
-            Lambdas_all[mIdx] = Lambdas_m
-        return Us_all, Lambdas_all
-
-    def getGroupedLocalPatches(self, hfList):
+    def getGroupedLocalPatches(self, hfList, pe_dim):
         grouped_data = [None] * self.nM
         for mIdx in range(self.nM):
-            grouped_data_m = [None] * (self.nS - 1)
-            for jj in range(self.nS - 1):
+            grouped_data_m = [None] * (self.nS)
+            for jj in range(self.nS):
                 HF = hfList[mIdx][jj]
                 nV = HF[:, 0].max().item() + 1
                 v_flaps_idx = {i: [] for i in range(nV)}
@@ -497,8 +397,8 @@ class TestMeshes:
                     
                     if degree not in deg_dict:
                         deg_dict[degree] = {'v0': [], 'flap_idx': [], 'he_idx': []}
-                        # 注入相对位置编码
-                        deg_dict[degree]['pos_enc'] = compute_positional_encoding(degree, d_model=16)
+                        deg_dict[degree]['pos_enc'] = compute_positional_encoding(degree, pe_dim)
+                        deg_dict[degree]['Q'] = compute_Q_matrix(degree)
                     
                     deg_dict[degree]['v0'].append(v0)
                     deg_dict[degree]['flap_idx'].append(flap_indices_all_views)
@@ -513,15 +413,17 @@ class TestMeshes:
             grouped_data[mIdx] = grouped_data_m
         return grouped_data
 
-    def computeParameters(self):
+    def computeParameters(self, pe_dim):
         self.hfList = self.getHalfFlap()
         self.poolMats, self.dofs = self.getFlapPool(self.hfList)
         self.LCs = self.getLaplaceCoordinate(self.hfList, self.poolMats, self.dofs)
-        self.VNs = self.getVertexNormals() # <--- 新增
-        self.Us, self.Lambdas = self.get_U_and_Lambda(self.dofs)
-        self.groupedLocalData = self.getGroupedLocalPatches(self.hfList)
+        #self.VNs = self.getVertexNormals() 
+        self.groupedLocalData = self.getGroupedLocalPatches(self.hfList, pe_dim)
 
     def toDevice(self, device):
+        for original in self.orig_meshes:
+            original.V = original.V.to(device)
+            original.F = original.F.to(device)
         for ii in range(self.nM):
             for jj in range(self.nS):
                 if jj == 0:
@@ -529,66 +431,87 @@ class TestMeshes:
                 self.meshes[ii][jj].F = self.meshes[ii][jj].F.to(device)
         for ii in range(self.nM):
             self.LCs[ii] = self.LCs[ii].to(device)
-            self.VNs[ii] = self.VNs[ii].to(device) # <--- 新增
-            for jj in range(self.nS - 1):
+            for jj in range(self.nS):
                 self.hfList[ii][jj] = self.hfList[ii][jj].to(device)
                 self.poolMats[ii][jj] = self.poolMats[ii][jj].to(device)
                 self.dofs[ii][jj] = self.dofs[ii][jj].to(device)
-                self.Us[ii][jj] = self.Us[ii][jj].to(device)
-                self.Lambdas[ii][jj] = self.Lambdas[ii][jj].to(device)
-                
                 deg_dict = self.groupedLocalData[ii][jj]
                 for deg in deg_dict:
                     deg_dict[deg]['v0'] = deg_dict[deg]['v0'].to(device)
                     deg_dict[deg]['flap_idx'] = deg_dict[deg]['flap_idx'].to(device)
                     deg_dict[deg]['he_idx'] = deg_dict[deg]['he_idx'].to(device)
                     if 'pos_enc' in deg_dict[deg]:
-                        deg_dict[deg]['pos_enc'] = deg_dict[deg]['pos_enc'].to(device) # <--- 新增
+                        deg_dict[deg]['pos_enc'] = deg_dict[deg]['pos_enc'].to(device)
+                    if 'Q' in deg_dict[deg]:
+                        deg_dict[deg]['Q'] = deg_dict[deg]['Q'].to(device)
+
 
 def computeFlapList(V, F, numSubd=2):
     FList = []
     halfFlapList = []
-    for iter in range(numSubd):
+    
+    for iter in range(numSubd+1):
         nV = V.size(0)
         VV, FF, S = tgp_midPointUp(V, F, 1)
+        
         rIdx = S._indices()[0, :]
         cIdx = S._indices()[1, :]
         val = S._values()
-        cIdx = cIdx[rIdx >= nV]
-        val = val[rIdx >= nV]
-        rIdx = rIdx[rIdx >= nV]
+        
+        mask = rIdx >= nV
+        cIdx = cIdx[mask]
+        val = val[mask]
+        rIdx = rIdx[mask]
         assert ((val == 0.5).all())
+        
         rIdx, idx = torch.sort(rIdx)
         cIdx = cIdx[idx]
         rIdx = rIdx[::2]  
         cIdx = cIdx.view(-1, 2)
-        flapIdx = torch.zeros(len(rIdx), 4).long()
-        for kk in range(len(rIdx)):
-            vi = cIdx[kk, 0]
-            vj = cIdx[kk, 1]
-            adjFi, _ = tgp.findIdx(F, vi)
-            adjFj, _ = tgp.findIdx(F, vj)
-            adjF = tgp.intersect1d(adjFi, adjFj)
-            assert (adjF.size(0) == 2)
-            f1 = F[adjF[0], :]
-            f2 = F[adjF[1], :]
-            f1roll = -tgp.findIdx(f1, vi)[0]
-            f2roll = -tgp.findIdx(f2, vi)[0]
-            f1_vi = tgp.roll1d(f1, f1roll)
-            f2_vi = tgp.roll1d(f2, f2roll)
-            if f1_vi[1] == vj:
-                f_first = f1_vi  
-                f_sec = f2_vi  
-            elif f2_vi[1] == vj:
-                f_first = f2_vi  
-                f_sec = f1_vi  
-            flapIdx[kk, :] = torch.tensor([vi, vj, f_first[2], f_sec[1]])
-        halfFlapIdx = flapIdx[:, [0, 1, 2, 3, 1, 0, 3, 2]]
-        halfFlapIdx = halfFlapIdx.reshape(-1, 4)
+        
+        # ==========================================================
+        # ==========================================================
+        
+        he0 = F[:, [0, 1]]
+        he1 = F[:, [1, 2]]
+        he2 = F[:, [2, 0]]
+        HE = torch.cat([he0, he1, he2], dim=0) # Shape: (3*nF, 2)
+        
+        op0 = F[:, 2]
+        op1 = F[:, 0]
+        op2 = F[:, 1]
+        opV = torch.cat([op0, op1, op2], dim=0) # Shape: (3*nF,)
+        
+        N = int(VV.size(0)) + 1 
+        he_keys = HE[:, 0].long() * N + HE[:, 1].long()
+        
+        sorted_idx = torch.argsort(he_keys)
+        sorted_he_keys = he_keys[sorted_idx]
+        sorted_opV = opV[sorted_idx]
+        
+        vi = cIdx[:, 0].long()
+        vj = cIdx[:, 1].long()
+        
+        c_keys_fwd = vi * N + vj
+        c_keys_bwd = vj * N + vi
+        
+        pos_fwd = torch.searchsorted(sorted_he_keys, c_keys_fwd)
+        pos_bwd = torch.searchsorted(sorted_he_keys, c_keys_bwd)
+        
+        v_first = sorted_opV[pos_fwd]
+        v_sec = sorted_opV[pos_bwd]
+        
+        flapIdx = torch.stack([vi, vj, v_first, v_sec], dim=1)
+        halfFlapIdx = flapIdx[:, [0, 1, 2, 3, 1, 0, 3, 2]].reshape(-1, 4)
+        
+        # ==========================================================
+        # ==========================================================
+        
         FList.append(F)
         halfFlapList.append(halfFlapIdx)
         V = VV
         F = FF
+        
     FList.append(F)
     halfFlapList.append(None)
     return FList, halfFlapList
