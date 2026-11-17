@@ -29,15 +29,15 @@ def main():
         torch.backends.cudnn.allow_tf32 = False
 
     depth = int(params["numSubd"])
+    base = SubdBaseNet(params)
     weights, normalization = load_base_checkpoint(
-        folder / BASE_CHECKPOINT, require_normalization=True)
+        folder / BASE_CHECKPOINT, model=base, require_normalization=True)
     meshes = load_coarse_mesh(args.mesh, depth, normalization)
     meshes.computeParameters(int(params["stage1_pe_dim"]))
     meshes.toDevice(device)
 
-    base = SubdBaseNet(params).to(device)
     base.load_state_dict(weights)
-    base.eval()
+    base.to(device).eval()
 
     disp = None
     if args.stage != "1":
