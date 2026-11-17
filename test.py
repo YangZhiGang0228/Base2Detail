@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from base_checkpoint import BASE_CHECKPOINT, load_base_checkpoint
 from include import TestMeshes, tgp
 from models import SubdBaseNet, SubdDispNet
 from stage2_checkpoint import STAGE2_QUANTIZED_CHECKPOINT, load_quantized_disp
@@ -14,9 +15,6 @@ def main():
     parser.add_argument("folder", type=Path, help="Directory containing hyperparameters and checkpoints.")
     parser.add_argument("mesh", type=Path, help="Coarse input OBJ.")
     parser.add_argument("--stage", choices=["1", "2", "all"], default="all")
-    parser.add_argument(
-        "--reference", type=Path,
-        help="Original high-resolution mesh used to recover the training normalization.")
     args = parser.parse_args()
 
     folder = args.folder.resolve()
@@ -30,22 +28,14 @@ def main():
         torch.backends.cudnn.allow_tf32 = False
 
     depth = int(params["numSubd"])
-    meshes = TestMeshes([str(args.mesh)], depth)
-    if args.reference:
-        reference_vertices, _ = tgp.readOBJ(str(args.reference))
-        coarse_vertices, _ = tgp.readOBJ(str(args.mesh))
-        maximum = reference_vertices.max(dim=0).values
-        minimum = reference_vertices.min(dim=0).values
-        center = (maximum + minimum) / 2.0
-        scale = ((maximum - minimum).max() / 2.0).clamp_min(1e-5)
-        meshes.transforms[0] = {"center": center, "scale": scale}
-        meshes.meshes[0][0].V = (coarse_vertices - center) / scale
+    weights, normalization = load_base_checkpoint(
+        folder / BASE_CHECKPOINT, require_normalization=True)
+    meshes = TestMeshes([str(args.mesh)], depth, transforms=[normalization])
     meshes.computeParameters(int(params["stage1_pe_dim"]))
     meshes.toDevice(device)
 
     base = SubdBaseNet(params).to(device)
-    base.load_state_dict(torch.load(
-        folder / "netparams_base.dat", map_location=device, weights_only=True))
+    base.load_state_dict(weights)
     base.eval()
 
     disp = None
