@@ -21,7 +21,7 @@ def main():
 
     data = {
         "model_name": "bimba",
-        "train_pkl": args.train_pkl or "./data_PKL/cartoon_elephant_train.pkl",
+        "train_pkl": args.train_pkl or "./data_PKL/train.pkl",
         "output_path": args.output,
         "device": "cuda",
         "seed": 2026,
