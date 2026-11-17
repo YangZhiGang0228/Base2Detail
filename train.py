@@ -128,7 +128,7 @@ def train_stage2(params, folder, epochs):
     level = int(params["numSubd"])
 
     net_base = SubdBaseNet(params).to(device)
-    weights, normalization = load_base_checkpoint(folder / BASE_CHECKPOINT)
+    weights, normalization = load_base_checkpoint(folder / BASE_CHECKPOINT, model=net_base)
     if normalization is not None and any(
         not torch.equal(normalization[key], torch.as_tensor(train_meshes.transforms[mesh_index][key]).cpu())
         for key in ("center", "scale")
@@ -150,6 +150,8 @@ def train_stage2(params, folder, epochs):
         reference_faces = train_meshes.orig_meshes[mesh_index].F.to(device)
 
     model = SubdDispNet(params).to(device)
+    model.anchor_idx.copy_(model.select_anchors(base))
+    model.anchor_ready.fill_(True)
     features = model.anchor_features(base).detach()
     base_normals = compute_vertex_normals(base, faces).detach()
     target_scalar = ((target - base) * base_normals).sum(dim=1, keepdim=True)
