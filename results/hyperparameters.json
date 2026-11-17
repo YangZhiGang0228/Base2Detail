@@ -1,0 +1,21 @@
+{
+  "device": "cuda",
+  "Dout": 32,
+  "stage1_pe_dim": 16,
+  "h_matrixNet": [
+    32,
+    32
+  ],
+  "h_FNet": [
+    32,
+    32
+  ],
+  "numSubd": 3,
+  "disp_n_anchor": 8,
+  "disp_anchor_pe_dim": 8,
+  "h_disp": [
+    96,
+    96,
+    28
+  ]
+}
