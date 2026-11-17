@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from include import tgp
+from base_checkpoint import BASE_CHECKPOINT, load_base_checkpoint, save_base_checkpoint
 from mesh_errors import normal_error, point2mesh_error
 from models import SubdBaseNet, SubdDispNet, compute_vertex_normals
 from stage2_checkpoint import (
@@ -14,9 +14,9 @@ from stage2_checkpoint import (
     load_quantized_disp,
     save_quantized_disp,
 )
+from tools.writeOBJ import writeOBJ
 
 
-BASE_CHECKPOINT = "netparams_base.dat"
 BEST_P2M_OBJ = "best_p2m.obj"
 
 
@@ -59,11 +59,10 @@ def train_stage1(params, folder, epochs):
     set_global_seed(params["seed"])
     device = torch.device(params["device"])
     train_meshes = load_meshes(params["train_pkl"], params)
-    valid_meshes = (train_meshes if Path(params["valid_pkl"]).resolve() == Path(params["train_pkl"]).resolve()
-                    else load_meshes(params["valid_pkl"], params))
+    if train_meshes.nM != 1:
+        raise ValueError("Stage 1 expects one training mesh per checkpoint.")
+    normalization = train_meshes.transforms[0]
     train_targets = [[mesh.V.to(device) for mesh in hierarchy] for hierarchy in train_meshes.meshes]
-    valid_targets = (train_targets if valid_meshes is train_meshes else
-                     [[mesh.V.to(device) for mesh in hierarchy] for hierarchy in valid_meshes.meshes])
 
     model = SubdBaseNet(params).to(device)
     for module in model.modules():
@@ -75,6 +74,7 @@ def train_stage1(params, folder, epochs):
     mse = torch.nn.MSELoss()
     best = float("inf")
     log_every = int(params["stage1_log_every"])
+    eval_every = int(params.get("stage1_eval_every", params.get("stage1_valid_eval_every", 10)))
 
     for epoch in range(epochs):
         model.train()
@@ -93,29 +93,28 @@ def train_stage1(params, folder, epochs):
             train_error += loss.detach()
         scheduler.step()
 
-        evaluate = epoch % int(params["stage1_valid_eval_every"]) == 0 or epoch == epochs - 1
-        valid_text = "skipped"
+        evaluate = epoch % eval_every == 0 or epoch == epochs - 1
+        terminal_text = "skipped"
         if evaluate:
             model.eval()
-            valid_error = 0.0
+            terminal_error = 0.0
             with torch.no_grad():
-                for mesh_index in range(valid_meshes.nM):
+                for mesh_index, targets in enumerate(train_targets):
                     outputs, _ = model(
-                        valid_meshes.getInputData(mesh_index), mesh_index,
-                        valid_meshes.hfList, valid_meshes.poolMats,
-                        valid_meshes.dofs, valid_meshes.groupedLocalData, return_features=False)
-                    target = valid_targets[mesh_index][-1]
-                    valid_error += float(mse(outputs[-1], target[:len(outputs[-1])]))
-            valid_error /= valid_meshes.nM
-            valid_text = "%.6e" % valid_error
-            if valid_error < best:
-                best = valid_error
-                torch.save(model.state_dict(), folder / BASE_CHECKPOINT)
+                        train_meshes.getInputData(mesh_index), mesh_index,
+                        train_meshes.hfList, train_meshes.poolMats,
+                        train_meshes.dofs, train_meshes.groupedLocalData, return_features=False)
+                    terminal_error += float(mse(outputs[-1], targets[-1][:len(outputs[-1])]))
+            terminal_error /= train_meshes.nM
+            terminal_text = "%.6e" % terminal_error
+            if terminal_error < best:
+                best = terminal_error
+                save_base_checkpoint(model, normalization, folder / BASE_CHECKPOINT)
 
         if evaluate or epoch % log_every == 0:
-            print("[Stage 1] epoch %d train %.6e valid %s" % (
+            print("[Stage 1] epoch %d train %.6e terminal MSE %s" % (
                 epoch, train_error / train_meshes.nM,
-                valid_text))
+                terminal_text))
 
     print("[Stage 1] best final-level MSE %.6e" % best)
 
@@ -129,8 +128,13 @@ def train_stage2(params, folder, epochs):
     level = int(params["numSubd"])
 
     net_base = SubdBaseNet(params).to(device)
-    net_base.load_state_dict(torch.load(
-        folder / BASE_CHECKPOINT, map_location=device, weights_only=True))
+    weights, normalization = load_base_checkpoint(folder / BASE_CHECKPOINT)
+    if normalization is not None and any(
+        not torch.equal(normalization[key], torch.as_tensor(train_meshes.transforms[mesh_index][key]).cpu())
+        for key in ("center", "scale")
+    ):
+        raise ValueError("The Stage 2 training cache uses different mesh normalization from Stage 1.")
+    net_base.load_state_dict(weights)
     net_base.requires_grad_(False)
     net_base.eval()
 
@@ -193,8 +197,8 @@ def train_stage2(params, folder, epochs):
             if p2m < best_p2m:
                 best_p2m = p2m
                 candidate.replace(checkpoint)
-                tgp.writeOBJ(str(folder / BEST_P2M_OBJ),
-                             reconstructed.cpu() * scale + center, faces.cpu())
+                writeOBJ(str(folder / BEST_P2M_OBJ),
+                         reconstructed.cpu() * scale + center, faces.cpu())
                 print("[Stage 2] epoch %d new best P2M %.6e, saved %s" % (
                     epoch, p2m, BEST_P2M_OBJ))
 
