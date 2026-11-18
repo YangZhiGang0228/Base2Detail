@@ -1,6 +1,6 @@
 # Base2Detail
 
-Base2Detail fits a two-stage neural representation to an individual triangle mesh. Stage 1 learns spectral subdivision, and Stage 2 adds scalar normal displacements.
+Base2Detail fits a two-stage neural representation to each triangle mesh independently. Stage 1 learns geometry-dependent spectral subdivision from multiresolution supervision. Stage 2 fits scalar displacements along the fixed terminal mesh normals using encoded distances to eight anchors.
 
 ## Environment
 
@@ -41,7 +41,9 @@ python train.py jobs/example --stage2-only
 
 ## Testing
 ```bash
-python test.py results data_meshes/example/subd0/001.obj
+python test.py results data_meshes/example/subd0/001.obj --stage 1
+python test.py results data_meshes/example/subd0/001.obj --stage 2
+python test.py results data_meshes/example/subd0/001.obj --stage all
 ```
 ## Acknowledgments
 
