@@ -1,1 +1,48 @@
-This is the implementation code for Base2Detail, partially adapted from neural subdivision. The full code will be updated soon.
+# Base2Detail
+
+Base2Detail fits a two-stage neural representation to an individual triangle mesh. Stage 1 learns spectral subdivision, and Stage 2 adds scalar normal displacements.
+
+## Environment
+
+Python 3.10, PyTorch 2.7.1+cu128, CUDA 12.8, PyTorch3D 0.7.9, NumPy 1.26.4, and SciPy 1.15.3.
+
+## Data preparation
+
+The example provides a reference OBJ, a coarse mesh, and three SSP supervision levels.
+
+```text
+data_meshes/example/
+    original/001.obj
+    subd0/001.obj
+    subd1/001.obj
+    subd2/001.obj
+    subd3/001.obj
+```
+
+For custom data, simplify a reference mesh and generate supervision using successive self-parameterization (SSP). A C++ implementation is available under `08_subdiv_remesh` in the [Surface Multigrid repository](https://github.com/HTDerekLiu/surface_multigrid_code).
+
+```bash
+python preprocessdata.py
+```
+
+This reads `data_meshes/example/`, normalizes all levels using the reference bounding-box center and half its longest side, and writes `data_PKL/train.pkl`. Both training stages use this cache.
+
+## Training
+```bash
+python writeHyperparam.py 
+python train.py ./results
+```
+To run the stages separately, execute these commands in order.
+
+```bash
+python train.py jobs/example --stage1-only
+python train.py jobs/example --stage2-only
+```
+
+## Testing
+```bash
+python test.py results data_meshes/example/subd0/001.obj
+```
+## Acknowledgments
+
+Parts of this implementation are adapted from [Neural Subdivision](https://github.com/HTDerekLiu/neuralSubdiv). See [LICENSE](LICENSE) for the source license.
