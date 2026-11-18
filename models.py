@@ -1,8 +1,7 @@
-from include import *
+import math
+
 import torch.nn.functional as F
 import torch
-import numpy as np
-import math
 
 
 def aggregate_cyclic_views(aligned, policy="all", view_offset=0, generator=None):
@@ -372,8 +371,7 @@ class SubdDispNet(torch.nn.Module):
 
     def anchor_features(self, pos):
         if not bool(self.anchor_ready.item()):
-            self.anchor_idx.copy_(self.select_anchors(pos.detach()))
-            self.anchor_ready.fill_(True)
+            raise ValueError("Initialize or load the Stage 2 anchor indices before using the model.")
         distance = (pos[:, None, :] - pos[self.anchor_idx][None, :, :]).norm(dim=2)
         distance = distance - distance.mean(dim=0, keepdim=True)
         distance = distance / distance.std(
