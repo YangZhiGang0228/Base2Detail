@@ -39,12 +39,16 @@ python train.py jobs/example --stage1-only
 python train.py jobs/example --stage2-only
 ```
 
-## Testing
+## Testing and decoding
+
+Decode the supplied pretrained example with an explicit stage selection.
+
 ```bash
 python test.py results data_meshes/example/subd0/001.obj --stage 1
 python test.py results data_meshes/example/subd0/001.obj --stage 2
 python test.py results data_meshes/example/subd0/001.obj --stage all
-```
 ## Acknowledgments
+```
+--stage 1` exports the spectral subdivision hierarchy and requires the Stage 1 parameters. `--stage 2` and `--stage all` both load the two parameters and export the hierarchy with normal displacement applied at the terminal level.
 
 Parts of this implementation are adapted from [Neural Subdivision](https://github.com/HTDerekLiu/neuralSubdiv). See [LICENSE](LICENSE) for the source license.
