@@ -25,8 +25,6 @@ def main():
     device = params["device"] if torch.cuda.is_available() else "cpu"
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
 
     depth = int(params["numSubd"])
     base = SubdBaseNet(params)
