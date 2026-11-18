@@ -1,13 +1,13 @@
 
 import argparse
 import json
-import pickle
 from pathlib import Path
 
 import torch
 
 from base_checkpoint import BASE_CHECKPOINT, load_base_checkpoint, save_base_checkpoint
 from mesh_errors import normal_error, point2mesh_error
+from preprocessdata import load_training_cache
 from models import SubdBaseNet, SubdDispNet, compute_vertex_normals
 from stage2_checkpoint import (
     STAGE2_QUANTIZED_CHECKPOINT,
@@ -48,8 +48,7 @@ def set_global_seed(seed):
 
 
 def load_meshes(path, params):
-    with open(path, "rb") as stream:
-        meshes = pickle.load(stream)
+    meshes = load_training_cache(path)
     meshes.computeParameters(int(params["stage1_pe_dim"]))
     meshes.toDevice(params["device"])
     return meshes
